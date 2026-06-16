@@ -20,8 +20,8 @@ use turbopack_core::{
     asset::AssetContent,
     context::AssetContext,
     ident::Layer,
-    issue::{IssueExt, IssueSeverity},
-    module_graph::{ModuleGraph, SingleModuleGraph},
+    issue::{IssueExt, IssueSeverity, StyledString},
+    module_graph::{ModuleGraph, ModuleGraphOptions, SingleModuleGraph},
     reference_type::{InnerAssets, ReferenceType},
     resolve::{
         ResolveResult,
@@ -737,8 +737,7 @@ async fn get_mock_stylesheet(
     let module_graph = ModuleGraph::from_graphs(
         vec![SingleModuleGraph::new_with_entries(
             entries.graph_entries().to_resolved().await?,
-            false,
-            false,
+            ModuleGraphOptions::default(),
         )],
         None,
     );

@@ -426,8 +426,9 @@ pub async fn traced_module_data_for_graph(
     let (idents, hashes): (FxHashMap<_, _>, FxHashMap<_, _>) = traced_modules
         .into_iter()
         .map(async |module| {
+            let ident = module_graph.module_ident_resolved(module)?.await?;
             Ok((
-                (module, module.ident().await?),
+                (module, ident),
                 (
                     module,
                     module
