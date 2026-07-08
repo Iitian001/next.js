@@ -169,25 +169,13 @@ pub async fn create_web_entry_source(
         .collect::<Vec<ResolvedVc<Box<dyn Module>>>>();
     let module_graph = ModuleGraph::from_graphs(
         vec![SingleModuleGraph::new_with_entries(
-        <<<<<<< HEAD
-                    GraphEntries::from_chunk_groups(vec![ChunkGroupEntry::Entry {
-                        modules: all_modules,
-                        heuristics: EntryHeuristics::default(),
-                    }])
-                    .resolved_cell(),
-                    false,
-                    false,
-        ||||||| parent of 5f2ce7aa024 (pre-cache idents)
-                    GraphEntries::from_chunk_groups(vec![ChunkGroupEntry::Entry(all_modules)])
-                        .resolved_cell(),
-                    false,
-                    false,
-        =======
-                    GraphEntries::from_chunk_groups(vec![ChunkGroupEntry::Entry(all_modules)])
-                        .resolved_cell(),
-                    ModuleGraphOptions::default(),
-        >>>>>>> 5f2ce7aa024 (pre-cache idents)
-                )],
+            GraphEntries::from_chunk_groups(vec![ChunkGroupEntry::Entry {
+                modules: all_modules,
+                heuristics: EntryHeuristics::default(),
+            }])
+            .resolved_cell(),
+            ModuleGraphOptions::default(),
+        )],
         None,
     );
     let module_graph = module_graph.connect().to_resolved().await?;
