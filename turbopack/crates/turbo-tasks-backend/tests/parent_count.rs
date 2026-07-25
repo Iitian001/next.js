@@ -6,7 +6,6 @@ mod util;
 
 use anyhow::Result;
 use turbo_tasks::{
-    ResolvedVc, State, TaskId, Vc, unmark_top_level_task_may_leak_eventually_consistent_state,
     ResolvedVc, State, TaskId, TurboTasks, Vc, prevent_gc,
     unmark_top_level_task_may_leak_eventually_consistent_state,
 };
@@ -56,17 +55,37 @@ async fn select(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
     Ok(Vc::cell(value))
 }
 
-/// Like `select`, but reads `pinned_branch` instead of `branch_a` when the selector is false.
+/// Re-executes when the selector flips while keeping the same child edge.
 #[turbo_tasks::function(operation, root)]
-async fn select_pinned(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
-    let use_b = *selector.await?.get();
-    let value = if use_b {
-        *branch_b().await?
-    } else {
-        *pinned_branch().await?
-    };
-    Ok(Vc::cell(value))
+async fn stable_child_parent(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
+    // Read the selector so we re-execute when it flips...
+    let bump = if *selector.await?.get() { 100 } else { 0 };
+    // ...but always connect the SAME child regardless.
+    let child = *leaf(30).await?;
+    Ok(Vc::cell(bump + child))
 }
+
+/// One leaf per index — distinct tasks, so a wide parent accumulates that many distinct children.
+#[turbo_tasks::function]
+fn wide_leaf(index: u32) -> Vc<u32> {
+    Vc::cell(index)
+}
+
+/// Reads `WIDE_FANOUT` distinct children — deliberately above `connect_children`'s 10_000
+/// parallelization threshold, so the child-side `parent_count` bump runs through the chunked,
+/// parallel `process_new_children` path (each chunk on its own worker context) rather than the
+/// serial one.
+const WIDE_FANOUT: u32 = 12_000;
+
+#[turbo_tasks::function(operation, root)]
+async fn wide_parent() -> Result<Vc<u32>> {
+    let mut sum = 0u32;
+    for index in 0..WIDE_FANOUT {
+        sum = sum.wrapping_add(*wide_leaf(index).await?);
+    }
+    Ok(Vc::cell(sum))
+}
+
 /// `parent_count` must track the number of persistent parents, incremented when a parent connects a
 /// child and decremented when it disconnects it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -140,16 +159,6 @@ async fn parent_count_tracks_connect_and_disconnect() {
     result.unwrap();
 }
 
-/// Re-executes when the selector flips while keeping the same child edge.
-#[turbo_tasks::function(operation, root)]
-async fn stable_child_parent(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
-    // Read the selector so we re-execute when it flips...
-    let bump = if *selector.await?.get() { 100 } else { 0 };
-    // ...but always connect the SAME child regardless.
-    let child = *leaf(30).await?;
-    Ok(Vc::cell(bump + child))
-}
-
 /// Re-validation must not double-count. When a parent re-executes and connects a child it was
 /// *already* connected to (the child is still in its persistent `children` set), the child must NOT
 /// gain a second `parent_count`: `connect_children` only bumps the *genuinely-new* children (those
@@ -194,8 +203,3 @@ async fn parent_count_not_double_counted_on_revalidation() {
     tt.stop_and_wait().await;
     result.unwrap();
 }
-
-/// A selector-gated root over the wide fanout, so flipping disconnects the whole `wide_parent`
-/// subtree cleanly. `wide_parent` has enough children to be promoted to an aggregating node, so
-/// disconnecting it exercises both GC discovery buffers: `wide_parent` loses its last persistent
-/// parent (count-zeroed) and the aggregation-graph rebalance that frees the leaves runs during the
