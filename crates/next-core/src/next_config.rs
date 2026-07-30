@@ -1431,6 +1431,10 @@ pub struct ExperimentalConfig {
     turbopack_local_postcss_config: Option<bool>,
     // Whether to enable the global-not-found convention
     global_not_found: Option<bool>,
+    /// Whether to enable variants: values resolved per request (from cookies,
+    /// headers, or a flags service) that a route can be prerendered against, in
+    /// addition to its route params.
+    variants: Option<bool>,
     /// Experimental Rust React compiler (Turbopack only); requires `reactCompiler`.
     turbopack_rust_react_compiler: Option<bool>,
     /// Defaults to false in development mode, true in production mode.
@@ -2016,6 +2020,11 @@ impl NextConfig {
     #[turbo_tasks::function]
     pub fn is_global_not_found_enabled(&self) -> Vc<bool> {
         Vc::cell(self.experimental.global_not_found.unwrap_or_default())
+    }
+
+    #[turbo_tasks::function]
+    pub fn is_variants_enabled(&self) -> Vc<bool> {
+        Vc::cell(self.experimental.variants.unwrap_or_default())
     }
 
     #[turbo_tasks::function]
