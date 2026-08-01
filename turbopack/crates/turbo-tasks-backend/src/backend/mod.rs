@@ -1078,11 +1078,13 @@ impl TurboTasksBackend {
                 "gc",
                 stats = tracing::field::Empty,
                 edges_deleted = tracing::field::Empty,
+                aged_out_roots = tracing::field::Empty,
             )
             .entered();
             let gc_phase = self.snapshot_coord.begin_gc();
             let (stats, roots) = self.gc_collect(turbo_tasks);
             gc_span.record("stats", display(stats));
+
             gc_roots_to_persist = Some(roots);
             gc_phase.into_snapshot()
         } else {
