@@ -30,7 +30,7 @@ use crate::{
     backend::{
         TaskDataCategory,
         operation::{
-            ExecuteContext, Operation, TaskGuard, connect_child::resurrect_deleted,
+            ExecuteContext, GcCandidate, Operation, TaskGuard, connect_child::resurrect_deleted,
             invalidate::make_task_dirty,
         },
         storage_schema::TaskStorageAccessors,
@@ -1460,8 +1460,10 @@ impl AggregationUpdateQueue {
                                  zero"
                             );
                             if task.is_gc_collectible() {
-                                ctx.note_gc_collectible(task.id());
-                            }
+                                ctx.note_gc_candidate(GcCandidate::Garbage(task.id()));
+                            } else if task.is_gc_root() {
+                                ctx.note_gc_candidate(GcCandidate::Root(task.id()));
+                            };
                         }
                     });
                 }
@@ -1469,8 +1471,8 @@ impl AggregationUpdateQueue {
                     ctx.for_each_task_meta(task_ids, "AdjustTransientRefCount", |mut task, ctx| {
                         if task.update_and_get_transient_ref_count(delta) == 0 {
                             if task.is_gc_collectible() {
-                                ctx.note_gc_collectible(task.id());
-                            }
+                                ctx.note_gc_candidate(GcCandidate::Garbage(task.id()));
+                            };
                         }
                     });
                 }
@@ -1941,7 +1943,7 @@ impl AggregationUpdateQueue {
                     let followers = get_followers(&follower);
                     // if uppers became empty, it might be collectible, check now.
                     if follower.is_upper_empty() && follower.is_gc_collectible() {
-                        ctx.note_gc_collectible(lost_follower_id);
+                        ctx.note_gc_candidate(GcCandidate::Garbage(lost_follower_id));
                     }
                     drop(follower);
 
@@ -2021,7 +2023,7 @@ impl AggregationUpdateQueue {
                     let upper_ids = get_uppers(&upper);
                     // If we dropped the last follower we might be collectible
                     if upper.is_followers_empty() && upper.is_gc_collectible() {
-                        ctx.note_gc_collectible(upper_id);
+                        ctx.note_gc_candidate(GcCandidate::Garbage(upper_id));
                     }
                     drop(upper);
 
@@ -2123,7 +2125,7 @@ impl AggregationUpdateQueue {
                 let followers = get_followers(&follower);
                 // If we dropped the last upper we might be collectible
                 if follower.is_upper_empty() && follower.is_gc_collectible() {
-                    ctx.note_gc_collectible(lost_follower_id);
+                    ctx.note_gc_candidate(GcCandidate::Garbage(lost_follower_id));
                 }
                 drop(follower);
 
@@ -2207,7 +2209,7 @@ impl AggregationUpdateQueue {
                     let upper_ids = get_uppers(&upper);
                     // If we dropped the last folower we might be collectible
                     if upper.is_followers_empty() && upper.is_gc_collectible() {
-                        ctx.note_gc_collectible(upper_id);
+                        ctx.note_gc_candidate(GcCandidate::Garbage(upper_id));
                     }
                     drop(upper);
 
@@ -2319,7 +2321,7 @@ impl AggregationUpdateQueue {
                     let followers = get_followers(&follower);
                     // If we dropped the last upper we might be collectible
                     if follower.is_upper_empty() && follower.is_gc_collectible() {
-                        ctx.note_gc_collectible(lost_follower_id);
+                        ctx.note_gc_candidate(GcCandidate::Garbage(lost_follower_id));
                     }
                     drop(follower);
 
@@ -2404,7 +2406,7 @@ impl AggregationUpdateQueue {
                 let upper_ids = get_uppers(&upper);
                 // If we dropped the last follower we might be collectible
                 if upper.is_followers_empty() && upper.is_gc_collectible() {
-                    ctx.note_gc_collectible(upper_id);
+                    ctx.note_gc_candidate(GcCandidate::Garbage(upper_id));
                 }
                 drop(upper);
 

@@ -16,7 +16,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::SystemTime,
 };
@@ -92,6 +92,13 @@ use crate::{
 /// the operation will be parallelized.
 const DEPENDENT_TASKS_DIRTY_PARALLELIZATION_THRESHOLD: usize = 10000;
 
+/// How long a GC root may go un-anchored before it is collected. A root that is not observed
+/// anchored (no persistent parent, no pin/transient reference) in any GC pass for this long is
+/// treated as a cross-session orphan and its subtree is reclaimed. The grace period tolerates
+/// transient absences — e.g. switching git branches away from and back to a route within the window
+/// keeps its warm cache. Overridable in tests/debugging via `TURBO_ENGINE_GC_ROOT_TTL_MS`.
+const GC_ROOT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Priority used to re-schedule a task that became stale during execution.
 ///
 /// Stale tasks must run again, but at a priority that reflects why they're being re-run rather
@@ -147,6 +154,12 @@ pub struct BackendOptions {
     /// This reclaims memory by clearing persisted data that can be re-loaded from disk on demand.
     /// This is an EXPERIMENTAL FEATURE under development
     pub eviction_mode: EvictionMode,
+
+    /// Overrides whether the reference-counting GC runs for this backend. `None` (default) derives
+    /// it from the `TURBO_ENGINE_GC` env var; `Some` forces it on/off (used by tests to run GC
+    /// — and persist the roots map — deterministically without racing the process-global env).
+    /// The debug eviction-safety check in the constructor still applies.
+    pub gc: Option<bool>,
 }
 
 impl Default for BackendOptions {
@@ -158,6 +171,7 @@ impl Default for BackendOptions {
             num_workers: None,
             small_preallocation: false,
             eviction_mode: EvictionMode::Off,
+            gc: None,
         }
     }
 }
@@ -228,6 +242,12 @@ pub struct TurboTasksBackend {
 
     backing_storage: TurboBackingStorage,
 
+    /// Test-only override of the GC root TTL, in milliseconds; `u64::MAX` means "unset" (use
+    /// [`GC_ROOT_TTL`] / the `TURBO_ENGINE_GC_ROOT_TTL_MS` env). A per-backend field rather than
+    /// the process-global env so parallel tests don't race each other. See
+    /// `set_gc_root_ttl_for_testing`.
+    gc_root_ttl_override_ms: AtomicU64,
+
     #[cfg(feature = "verify_aggregation_graph")]
     root_tasks: Mutex<FxHashSet<TaskId>>,
 }
@@ -289,6 +309,7 @@ impl TurboTasksBackend {
             is_idle: AtomicBool::new(false),
             task_statistics: TaskStatisticsApi::default(),
             backing_storage,
+            gc_root_ttl_override_ms: AtomicU64::new(u64::MAX),
             #[cfg(feature = "verify_aggregation_graph")]
             root_tasks: Default::default(),
         }
@@ -374,8 +395,17 @@ impl TurboTasksBackend {
             .unwrap_or(0)
     }
 
-    /// Opens `task` with the must-exist [`ExecuteContext::task`] and drops the guard. Test-only
-    /// hook to exercise the non-fabricating existence guarantee: this panics if `task` exists in
+    /// Override the GC root TTL for this backend (milliseconds). `0` ages out any un-anchored root
+    /// on the next GC pass. Per-backend, so parallel tests don't race the global env.
+    /// Test-only.
+    #[doc(hidden)]
+    pub fn set_gc_root_ttl_for_testing(&self, ttl_ms: u64) {
+        self.gc_root_ttl_override_ms
+            .store(ttl_ms, Ordering::Relaxed);
+    }
+
+    /// Opens `task` with must-exist access and drops the guard. Test-only hook to exercise
+    /// the non-fabricating existence guarantee: this panics (debug builds) if `task` exists in
     /// neither memory nor persistent storage (rather than fabricating a blank).
     #[doc(hidden)]
     pub fn assert_task_exists_for_testing(
@@ -1038,6 +1068,10 @@ impl TurboTasksBackend {
 
         // Hand the GC pass's exclusion straight to the snapshot (`into_snapshot`) so the collected
         // tasks' tombstones (derived from the `deleted` flag) ride this same commit.
+        // The GC roots map (task -> last-anchored-ms), refreshed by the GC pass and persisted in
+        // this same commit. `None` when GC didn't run, so `save_snapshot` leaves the prior
+        // set untouched.
+        let mut gc_roots_to_persist: Option<Vec<(TaskId, u64)>> = None;
         let mut snapshot_phase = if self.gc_enabled {
             let gc_span = tracing::info_span!(
                 parent: parent_span.clone(),
@@ -1047,8 +1081,9 @@ impl TurboTasksBackend {
             )
             .entered();
             let gc_phase = self.snapshot_coord.begin_gc();
-            let stats = self.gc_collect(turbo_tasks);
+            let (stats, roots) = self.gc_collect(turbo_tasks);
             gc_span.record("stats", display(stats));
+            gc_roots_to_persist = Some(roots);
             gc_phase.into_snapshot()
         } else {
             self.snapshot_coord.begin_snapshot()
@@ -1375,9 +1410,11 @@ impl TurboTasksBackend {
         // Tasks were already consumed by take_snapshot, so a future snapshot
         // would not re-persist them — returning an error signals to the caller
         // that further persist attempts would corrupt the task graph in storage.
-        let snapshot_meta = self
-            .backing_storage
-            .save_snapshot(suspended_operations, task_snapshots)?;
+        let snapshot_meta = self.backing_storage.save_snapshot(
+            suspended_operations,
+            gc_roots_to_persist,
+            task_snapshots,
+        )?;
         span.record("snapshot_meta", display(snapshot_meta));
 
         #[cfg(feature = "print_cache_item_size")]

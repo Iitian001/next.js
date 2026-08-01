@@ -6,8 +6,7 @@ mod util;
 
 use anyhow::Result;
 use turbo_tasks::{
-    ResolvedVc, State, TaskId, TurboTasks, Vc, prevent_gc,
-    unmark_top_level_task_may_leak_eventually_consistent_state,
+    ResolvedVc, State, TaskId, Vc, unmark_top_level_task_may_leak_eventually_consistent_state,
 };
 
 use crate::util::create_tt;

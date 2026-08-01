@@ -883,6 +883,20 @@ impl TaskStorage {
             && self.upper().is_empty()
             && self.followers().is_none_or(|f| f.is_empty())
     }
+
+    /// Whether this task is a durable GC **root**: parent-less, but anchored by a live external
+    /// reference (`transient_ref_count > 0`) rather than by the tracked graph.
+    ///
+    /// The `is_restored(Meta)` gate is load-bearing for the same reason as in
+    /// `gc_maybe_collectible` (an evicted-Meta task reads `parent_count` as 0 and would look
+    /// like a spurious root). Callers must also confirm `!task_id.is_transient()` (a
+    /// `TaskStorage` has no id).
+    pub fn gc_is_root(&self) -> bool {
+        self.flags.is_restored(TaskDataCategory::Meta)
+            && !self.flags.deleted()
+            && self.gc_parent_count() == 0
+            && self.gc_transient_ref_count() > 0
+    }
 }
 
 /// Counts for aggregation tree and collectibles fields.

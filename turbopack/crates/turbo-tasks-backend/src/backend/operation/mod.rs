@@ -55,6 +55,22 @@ enum TaskAccess {
     MustExist,
 }
 
+/// What a task became at the moment a GC-predicate clause changed in its favor — recorded by
+/// [`ExecuteContext::note_gc_candidate`] and acted on by the collector.
+///
+/// The two are mutually exclusive: a task with no persistent parent either has an external anchor
+/// (a root) or does not (garbage).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GcCandidate {
+    /// Parent-less and unanchored — it satisfied
+    /// [`is_gc_collectible`](TaskGuard::is_gc_collectible) and should be collected.
+    Garbage(TaskId),
+    /// Parent-less but still anchored from outside the tracked graph (a pin / transient ref), or
+    /// still holding aggregation edges. It just became a durable root, so it must enter the
+    /// persisted roots map with a fresh timestamp and start aging rather than be collected.
+    Root(TaskId),
+}
+
 pub trait ExecuteContext<'e>: Sized {
     type TaskGuardImpl: TaskGuard + 'e;
     fn child_context<'l, 'r>(&'r self) -> impl ChildExecuteContext<'l> + use<'e, 'l, Self>
@@ -139,10 +155,10 @@ pub trait ExecuteContext<'e>: Sized {
         T: Clone + Into<AnyOperation>;
     /// Use to record tasks that become collectible during execution of this context.
     /// Only a GC context accumulates these; a normal operation context discards them.
-    fn note_gc_collectible(&mut self, task_id: TaskId);
+    fn note_gc_candidate(&mut self, candidate: GcCandidate);
     /// Takes the ids recorded by [`Self::note_gc_collectible`] since the last call. Empty outside
     /// a GC context.
-    fn take_gc_collectible(&mut self) -> Vec<TaskId>;
+    fn take_gc_candidates(&mut self) -> Vec<GcCandidate>;
     fn should_track_dependencies(&self) -> bool;
     fn should_track_activeness(&self) -> bool;
     fn turbo_tasks(&self) -> Arc<dyn TurboTasksCallApi>;
@@ -219,8 +235,9 @@ pub struct ExecuteContextImpl<'e> {
     turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
     _operation_guard: Option<OperationGuard<'e, AnyOperation>>,
     task_lock_counter: TaskLockCounter,
-    /// GC-only: ids that became GC-collectible during this context's operations.
-    gc_collectible: Option<Vec<TaskId>>,
+    /// GC-only: tasks that became garbage or became durable roots during this context's
+    /// operations. `None` for normal contexts, which makes the recording hook a no-op.
+    gc_candidates: Option<Vec<GcCandidate>>,
 }
 
 impl<'e> ExecuteContextImpl<'e> {
@@ -233,7 +250,7 @@ impl<'e> ExecuteContextImpl<'e> {
             turbo_tasks,
             _operation_guard: Some(backend.start_operation()),
             task_lock_counter: TaskLockCounter::new(),
-            gc_collectible: None,
+            gc_candidates: None,
         }
     }
 
@@ -255,7 +272,7 @@ impl<'e> ExecuteContextImpl<'e> {
             turbo_tasks,
             _operation_guard: None,
             task_lock_counter: TaskLockCounter::new(),
-            gc_collectible: Some(Vec::new()),
+            gc_candidates: Some(Vec::new()),
         }
     }
 
@@ -1171,14 +1188,14 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
         self.backend.operation_suspend_point(|| op.clone().into());
     }
 
-    fn note_gc_collectible(&mut self, task_id: TaskId) {
-        if let Some(collectible) = self.gc_collectible.as_mut() {
-            collectible.push(task_id);
+    fn note_gc_candidate(&mut self, candidate: GcCandidate) {
+        if let Some(candidates) = self.gc_candidates.as_mut() {
+            candidates.push(candidate);
         }
     }
 
-    fn take_gc_collectible(&mut self) -> Vec<TaskId> {
-        self.gc_collectible
+    fn take_gc_candidates(&mut self) -> Vec<GcCandidate> {
+        self.gc_candidates
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
@@ -1243,7 +1260,7 @@ impl<'e> ChildExecuteContext<'e> for ChildExecuteContextImpl<'e> {
             turbo_tasks: self.turbo_tasks,
             _operation_guard: None,
             task_lock_counter: TaskLockCounter::new(),
-            gc_collectible: None,
+            gc_candidates: None,
         }
     }
 }
@@ -1386,6 +1403,15 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
         !self.id().is_transient() && {
             self.check_access(SpecificTaskDataCategory::Meta);
             self.typed().gc_maybe_collectible()
+        }
+    }
+
+    fn is_gc_root(&self) -> bool {
+        // Transient-ness is a property of the id, not the storage; transient tasks are never
+        // collected.
+        !self.id().is_transient() && {
+            self.check_access(SpecificTaskDataCategory::Meta);
+            self.typed().gc_is_root()
         }
     }
 
