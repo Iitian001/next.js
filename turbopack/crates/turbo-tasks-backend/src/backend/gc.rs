@@ -285,12 +285,16 @@ impl TurboTasksBackend {
                 // read out of the resident map, and a cascade child was just
                 // decremented through its resident entry.
                 let mut task = ctx.task(task_id, TaskDataCategory::All);
-                // Collectibility was checked when this job was queued, but jobs run concurrently: a
-                // sibling job's cascade can since have collected this task (it is then `deleted`)
-                // or flipped it non-collectible (regained `activeness`/`in_progress`, or gained an
-                // aggregation edge). Re-check under the guard we now hold and skip rather than
-                // delete — collecting twice would double-run the edge teardown. A task that is
-                // still genuinely garbage is re-selected by a later pass.
+                // Collectibility was checked when this job was seeded (the shard scan's
+                // `gc_maybe_collectible` pre-filter, the aged-out revalidation, or the cascade's
+                // per-child `is_gc_collectible` at spawn), but jobs run **concurrently**: in
+                // between, a sibling job's cascade can have collected this very task (it is then
+                // `deleted`) or flipped it non-collectible (regain `activeness`/`in_progress`, gain
+                // an aggregation edge, or — critically — pick up a new anchor). Re-check under the
+                // guard we now hold and skip rather than delete; a task that is still genuinely
+                // garbage is re-selected by a later pass, so bailing here is safe and self-healing.
+                // (Deleting unconditionally would wrongly collect a task that just regained an
+                // anchor, or double-run the edge teardown on one already collected.)
                 if !task.is_gc_collectible() {
                     return ControlFlow::Continue(());
                 }
