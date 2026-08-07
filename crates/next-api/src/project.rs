@@ -2585,11 +2585,6 @@ impl Project {
         let root = self.server_hmr_root_path().owned().await?;
         let chunks_versioned_content = map.hmr_chunks_in_path(root).await?;
 
-        // No chunks to diff yet (e.g. before any endpoints have been written).
-        if chunks_versioned_content.is_empty() {
-            return Ok(Update::None.cell());
-        }
-
         // Build `to` up front so we can return it on every escape hatch below.
         let to_aggregate = AggregateHmrVersion::from_chunks(&chunks_versioned_content).await?;
         let to_ref = Vc::upcast::<Box<dyn Version>>(to_aggregate)
@@ -2599,27 +2594,30 @@ impl Project {
         let DiffResult {
             chunk_updates,
             has_new_chunks,
+            removed_entries,
         } = diff_chunks_against(&chunks_versioned_content, from).await?;
 
-        // Nothing to apply, but `from` still needs to advance to `to`. Reaching
-        // here means `from` held a version we couldn't diff against (it wasn't an
-        // `AggregateHmrVersion`), so `diff_chunks_against` gave up and returned
-        // nothing. An empty `Partial` moves the subscription's state forward so
-        // the *next* change produces a real diff; returning `Total` instead would
-        // force a needless full re-evaluation.
-        if chunk_updates.is_empty() && !has_new_chunks {
+        // No entry produced work, but `from` still needs to advance to `to`.
+        // This covers empty/seed snapshots and a prior version which couldn't
+        // be diffed as an `AggregateHmrVersion`. An empty `Partial` carries the
+        // current version forward so the next change produces a fresh diff;
+        // returning `Total` would force a needless full re-evaluation.
+        if chunk_updates.is_empty() && !has_new_chunks && removed_entries.is_empty() {
             return Ok(ChunkListUpdateBuilder::default().build(to_ref).cell());
         }
 
         let mut builder = ChunkListUpdateBuilder::default();
-        for (_path, update) in chunk_updates {
+        for path in removed_entries {
+            builder.add_affected_entry(path.as_str());
+        }
+        for (path, update) in chunk_updates {
             match &*update {
                 Update::None => {}
                 Update::Missing | Update::Total(_) => {
                     return Ok(Update::Total(TotalUpdate { to: to_ref }).cell());
                 }
                 Update::Partial(PartialUpdate { instruction, .. }) => {
-                    builder.add_instruction(instruction);
+                    builder.add_entry_instruction(path.as_str(), instruction);
                 }
             }
         }

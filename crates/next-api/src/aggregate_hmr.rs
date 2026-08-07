@@ -1,4 +1,7 @@
+use std::collections::BTreeSet;
+
 use anyhow::Result;
+use rustc_hash::FxHashSet;
 use turbo_rcstr::RcStr;
 use turbo_tasks::{
     FxIndexMap, FxIndexSet, NonLocalValue, ReadRef, ResolvedVc, TraitRef, TryJoinIterExt, Vc,
@@ -109,9 +112,47 @@ impl AggregateHmrVersion {
 pub struct ChunkListUpdateBuilder {
     chunks: FxIndexMap<RcStr, ChunkUpdate>,
     merged: FxIndexSet<EcmascriptMergedUpdate>,
+    affected_entries: BTreeSet<RcStr>,
 }
 
 impl ChunkListUpdateBuilder {
+    /// Adds an entry's instruction and records that entry when the instruction
+    /// contains runtime work. Recording happens before merged instructions are
+    /// deduplicated so a shared update retains every owning entry.
+    pub fn add_entry_instruction(&mut self, path: &str, instruction: &UpdateInstruction) {
+        if Self::instruction_has_changes(instruction) {
+            self.affected_entries.insert(path.into());
+        }
+        self.add_instruction(instruction);
+    }
+
+    /// Records an entry whose chunk list disappeared from the aggregate.
+    pub fn add_affected_entry(&mut self, path: &str) {
+        self.affected_entries.insert(path.into());
+    }
+
+    /// Whether an update instruction carries runtime work. Seed/version-only
+    /// shapes (empty chunk maps, merged updates without entries or chunks)
+    /// carry no code and must not mark the entry. Unknown instruction types
+    /// conservatively count as changes: a future protocol addition degrades
+    /// to a spurious scope reload (safe) instead of a silently dropped update.
+    fn instruction_has_changes(instruction: &UpdateInstruction) -> bool {
+        let Some(instruction) = instruction.downcast_ref::<EcmascriptUpdateInstruction>() else {
+            return true;
+        };
+        match instruction {
+            EcmascriptUpdateInstruction::ChunkList(update) => {
+                !update.chunks.is_empty()
+                    || update.merged.iter().any(Self::merged_has_changes)
+            }
+            EcmascriptUpdateInstruction::Merged(update) => Self::merged_has_changes(update),
+        }
+    }
+
+    fn merged_has_changes(update: &EcmascriptMergedUpdate) -> bool {
+        !update.entries.is_empty() || !update.chunks.is_empty()
+    }
+
     pub fn add_instruction(&mut self, instruction: &UpdateInstruction) {
         let instruction = instruction
             .downcast_ref::<EcmascriptUpdateInstruction>()
@@ -135,7 +176,7 @@ impl ChunkListUpdateBuilder {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.chunks.is_empty() && self.merged.is_empty()
+        self.chunks.is_empty() && self.merged.is_empty() && self.affected_entries.is_empty()
     }
 
     pub fn build(self, to: TraitRef<Box<dyn Version>>) -> Update {
@@ -144,6 +185,9 @@ impl ChunkListUpdateBuilder {
             instruction: ChunkListUpdate {
                 chunks: self.chunks,
                 merged: self.merged.into_iter().collect(),
+                // BTreeSet iteration is sorted, so affected entries are
+                // deterministic across polls.
+                affected_entries: self.affected_entries.into_iter().collect(),
             }
             .into_instruction(),
         })
@@ -157,6 +201,24 @@ impl ChunkListUpdateBuilder {
 pub struct DiffResult {
     pub chunk_updates: Vec<(RcStr, ReadRef<Update>)>,
     pub has_new_chunks: bool,
+    pub removed_entries: Vec<RcStr>,
+}
+
+fn find_removed_entries<'a, 'b>(
+    previous_paths: impl IntoIterator<Item = &'a RcStr>,
+    current_paths: impl IntoIterator<Item = &'b RcStr>,
+) -> Vec<RcStr> {
+    let current_paths = current_paths
+        .into_iter()
+        .map(|path| path.as_str())
+        .collect::<FxHashSet<_>>();
+    let mut removed_entries = previous_paths
+        .into_iter()
+        .filter(|path| !current_paths.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    removed_entries.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    removed_entries
 }
 
 /// Diffs each chunk against the [`AggregateHmrVersion`] held by `from`.
@@ -168,21 +230,20 @@ pub async fn diff_chunks_against(
     chunks: &[HmrChunkWithContent],
     from: Vc<VersionState>,
 ) -> Result<DiffResult> {
-    if chunks.is_empty() {
-        return Ok(DiffResult {
-            chunk_updates: Vec::new(),
-            has_new_chunks: false,
-        });
-    }
     let from_resolved = from.get().to_resolved().await?;
     let Some(from_aggregate) = ResolvedVc::try_downcast_type::<AggregateHmrVersion>(from_resolved)
     else {
         return Ok(DiffResult {
             chunk_updates: Vec::new(),
             has_new_chunks: false,
+            removed_entries: Vec::new(),
         });
     };
     let from_aggregate = from_aggregate.await?;
+    let removed_entries = find_removed_entries(
+        from_aggregate.versions.keys(),
+        chunks.iter().map(|chunk| &chunk.path),
+    );
 
     let mut has_new_chunks = false;
     let chunk_updates = chunks
@@ -203,13 +264,18 @@ pub async fn diff_chunks_against(
     Ok(DiffResult {
         chunk_updates,
         has_new_chunks,
+        removed_entries,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use turbo_tasks::{FxIndexMap, FxIndexSet};
-    use turbopack_core::update_instruction::UpdateInstruction;
+    use turbo_tasks::{FxIndexMap, FxIndexSet, ResolvedVc, TraitRef};
+    use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
+    use turbopack_core::{
+        update_instruction::UpdateInstruction,
+        version::{Update, Version},
+    };
     use turbopack_ecmascript::chunk_list::{
         merged_update::{
             EcmascriptMergedChunkDeleted, EcmascriptMergedChunkUpdate, EcmascriptMergedUpdate,
@@ -217,7 +283,7 @@ mod tests {
         update::{ChunkListUpdate, ChunkUpdate, EcmascriptUpdateInstruction},
     };
 
-    use super::ChunkListUpdateBuilder;
+    use super::{AggregateHmrVersion, ChunkListUpdateBuilder, find_removed_entries};
 
     fn merged(chunk_path: &str) -> EcmascriptMergedUpdate {
         EcmascriptMergedUpdate {
@@ -261,6 +327,7 @@ mod tests {
                 ("b.js".into(), ChunkUpdate::Added),
             ]),
             merged: vec![],
+            affected_entries: Default::default(),
         };
         let second = ChunkListUpdate {
             chunks: FxIndexMap::from_iter([
@@ -268,6 +335,7 @@ mod tests {
                 ("c.js".into(), ChunkUpdate::Total),
             ]),
             merged: vec![],
+            affected_entries: Default::default(),
         };
 
         builder.add_instruction(&first.into_instruction());
@@ -282,5 +350,98 @@ mod tests {
             ["a.js", "b.js", "c.js"]
         );
         assert_eq!(builder.chunks["a.js"], ChunkUpdate::Deleted);
+    }
+
+    #[test]
+    fn tracks_all_entries_before_deduplicating_shared_updates() {
+        let shared = merged("shared.js");
+        let instruction =
+            UpdateInstruction::new(EcmascriptUpdateInstruction::Merged(shared.clone()));
+        let mut builder = ChunkListUpdateBuilder::default();
+
+        builder.add_entry_instruction("z/route.js", &instruction);
+        builder.add_entry_instruction("a/route.js", &instruction);
+
+        assert_eq!(
+            builder
+                .affected_entries
+                .iter()
+                .map(|path| path.as_str())
+                .collect::<Vec<_>>(),
+            ["a/route.js", "z/route.js"]
+        );
+        assert_eq!(builder.merged, FxIndexSet::from_iter([shared]));
+    }
+
+    #[test]
+    fn ignores_seed_and_version_only_instructions() {
+        let mut builder = ChunkListUpdateBuilder::default();
+        builder.add_entry_instruction(
+            "one/route.js",
+            &ChunkListUpdate {
+                chunks: FxIndexMap::default(),
+                merged: vec![EcmascriptMergedUpdate {
+                    entries: Default::default(),
+                    chunks: Default::default(),
+                }],
+                affected_entries: Default::default(),
+            }
+            .into_instruction(),
+        );
+
+        assert!(builder.affected_entries.is_empty());
+    }
+
+    #[test]
+    fn reports_removed_entries_deterministically_including_the_final_entry() {
+        let previous = [RcStr::from("z/route.js"), RcStr::from("a/route.js")];
+        let current = [RcStr::from("a/route.js")];
+        assert_eq!(
+            find_removed_entries(previous.iter(), current.iter()),
+            [RcStr::from("z/route.js")]
+        );
+
+        let no_current_entries: [RcStr; 0] = [];
+        assert_eq!(
+            find_removed_entries(previous.iter(), no_current_entries.iter()),
+            [RcStr::from("a/route.js"), RcStr::from("z/route.js")]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn affected_entry_only_update_advances_the_version() {
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async {
+            let mut builder = ChunkListUpdateBuilder::default();
+            builder.add_affected_entry("app/removed/route.js");
+
+            let to = ResolvedVc::upcast::<Box<dyn Version>>(
+                AggregateHmrVersion {
+                    versions: Default::default(),
+                }
+                .resolved_cell(),
+            )
+            .into_trait_ref()
+            .await?;
+            let Update::Partial(update) = builder.build(to.clone()) else {
+                panic!("an affected-entry-only update must be partial");
+            };
+
+            assert!(TraitRef::ptr_eq(&update.to, &to));
+            assert_eq!(
+                serde_json::to_value(&update.instruction)?,
+                serde_json::json!({
+                    "type": "ChunkListUpdate",
+                    "affectedEntries": ["app/removed/route.js"]
+                })
+            );
+
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 }
