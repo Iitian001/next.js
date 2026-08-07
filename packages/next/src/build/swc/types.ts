@@ -252,6 +252,8 @@ export interface NodeJsChunkListUpdate {
   type: 'ChunkListUpdate'
   merged?: NodeJsEcmascriptMergedUpdate[]
   chunks?: Record<string, { type: 'added' | 'deleted' | 'total' | 'partial' }>
+  /** Entry chunk lists which contributed real work to this aggregate update. */
+  affectedEntries?: string[]
 }
 
 export interface NodeJsPartialHmrUpdate extends BaseUpdate {
