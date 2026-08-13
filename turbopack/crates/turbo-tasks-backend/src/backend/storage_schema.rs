@@ -230,6 +230,18 @@ struct TaskStorageSchema {
     #[field(storage = "flag", category = "transient")]
     pub new_task: bool,
 
+    /// GC soft-deletion marker. Set by the garbage collector when a task is collected: its edges
+    /// have been scrubbed and it is destined for deletion, but it stays **resident** until the
+    /// next snapshot tombstones its on-disk copy and a later step hard-deletes it. Staying
+    /// resident closes the resurrection window — any `ctx.task` on it during the pass finds a
+    /// real entry rather than restoring a zombie from disk. Cleared (and the task marked
+    /// dirty) if a connect resurrects it before the hard-delete. Never persisted: a crash just
+    /// leaves the task on disk to be re-collected next session. Because it is a transient
+    /// flag, setting it does not implicitly track a modification, so the GC mark explicitly
+    /// calls `track_modification(Meta)` to force the task into the next snapshot's scan.
+    #[field(storage = "flag", category = "transient")]
+    deleted: bool,
+
     // =========================================================================
     // CHILDREN & AGGREGATION (meta)
     // =========================================================================
@@ -268,7 +280,7 @@ struct TaskStorageSchema {
         shrink_on_completion,
         drop_on_completion_if_immutable
     )]
-    cell_dependencies: AutoSet<CellRef, 2>,
+    cell_dependencies: AutoSet<CellRef, 3>,
 
     /// Cells this task depends on, narrowed to a hashed sub-value (`CellDependency::Hash`). Rare.
     #[field(
@@ -296,7 +308,7 @@ struct TaskStorageSchema {
 
     /// Outdated keyless cell dependencies to be cleaned up (transient).
     #[field(storage = "auto_set", category = "transient", shrink_on_completion)]
-    outdated_cell_dependencies: AutoSet<CellRef, 2>,
+    outdated_cell_dependencies: AutoSet<CellRef, 3>,
 
     /// Outdated hashed cell dependencies to be cleaned up (transient).
     #[field(storage = "auto_set", category = "transient", shrink_on_completion)]
@@ -318,7 +330,7 @@ struct TaskStorageSchema {
         filter_transient,
         drop_on_completion_if_immutable
     )]
-    cell_dependents: AutoSet<CellRef, 2>,
+    cell_dependents: AutoSet<CellRef, 3>,
 
     /// Tasks that depend on a hashed sub-value of this task's cells. Reverse of
     /// `cell_dependencies_hashed`.
@@ -853,6 +865,59 @@ impl TaskStorage {
     pub fn gc_transient_ref_count(&self) -> u32 {
         self.get_transient_ref_count().copied().unwrap_or(0)
     }
+
+    /// The storage-only part of GC collectibility. Does NOT include the transient-*id* check (a
+    /// `TaskStorage` has no id) — the caller must also confirm `!task_id.is_transient()`.
+    /// [`TaskGuard::is_gc_collectible`](crate::backend::operation::TaskGuard::is_gc_collectible)
+    /// is the authoritative predicate; it adds the id check and delegates here.
+    ///
+    /// **The `is_restored(Meta)` gate is load-bearing.** `parent_count` and the aggregation-edge
+    /// fields are Meta-category, so a task whose `Meta` has been evicted (`drop_partial`) reads
+    /// them as their defaults — `parent_count == 0`, empty `upper`/`followers` — and would look
+    /// collectible even though its *persisted* Meta says otherwise. This raw predicate has no
+    /// guard to restore Meta from disk, so it must refuse to judge an unrestored task and leave it
+    /// for a pass after it is next restored.
+    ///
+    /// The aggregation-edges check is conservative: a disconnected task is typically removed from
+    /// the aggregation graph, but that can lag and race GC, so we back off rather than collect.
+    pub fn gc_maybe_collectible(&self) -> bool {
+        self.flags.is_restored(TaskDataCategory::Meta)
+            // Already collected this session (soft-deleted, awaiting tombstone + hard-delete):
+            // don't re-select it, or a second pass would collect it again while it is still
+            // resident.
+            && !self.flags.deleted()
+            && self.gc_parent_count() == 0
+            && self.gc_transient_ref_count() == 0
+            && self.get_activeness().is_none()
+            && self.get_in_progress().is_none()
+            && self.upper().is_empty()
+            && self.followers().is_none_or(|f| f.is_empty())
+    }
+
+    /// Test-only: the first incoming aggregation-edge target (`upper` or `follower`) of this task
+    /// for which `is_gone(target)` reports true, or `None` if every target is still present.
+    /// Transient targets are skipped — never persisted, never GC-collected. See
+    /// [`Storage::find_dangling_aggregation_edge`](crate::backend::storage::Storage::find_dangling_aggregation_edge)
+    /// for how the caller supplies `is_gone`.
+    #[doc(hidden)]
+    pub fn first_dangling_aggregation_edge(
+        &self,
+        mut is_gone: impl FnMut(TaskId) -> bool,
+    ) -> Option<TaskId> {
+        for (target, _) in self.upper().iter() {
+            if !target.is_transient() && is_gone(*target) {
+                return Some(*target);
+            }
+        }
+        if let Some(followers) = self.followers() {
+            for (target, _) in followers.iter() {
+                if !target.is_transient() && is_gone(*target) {
+                    return Some(*target);
+                }
+            }
+        }
+        None
+    }
 }
 
 /// Counts for aggregation tree and collectibles fields.
@@ -1072,6 +1137,38 @@ mod tests {
         assert_eq!(
             storage.followers().unwrap().get(&TaskId::new(30).unwrap()),
             Some(&5)
+        );
+    }
+
+    #[test]
+    fn test_first_dangling_aggregation_edge() {
+        let mut storage = TaskStorage::new();
+        let upper = TaskId::new(5).unwrap();
+        let follower = TaskId::new(30).unwrap();
+        storage.upper_mut().insert(upper, 1);
+        storage.followers_mut().insert(follower, 1);
+
+        assert_eq!(storage.first_dangling_aggregation_edge(|_| false), None);
+
+        assert_eq!(
+            storage.first_dangling_aggregation_edge(|t| t == upper),
+            Some(upper)
+        );
+
+        // Falls through to followers when upper is fine.
+        assert_eq!(
+            storage.first_dangling_aggregation_edge(|t| t == follower),
+            Some(follower)
+        );
+
+        // Transient targets are never reported, even when the predicate says gone: they are never
+        // persisted or GC-collected, so an edge to one is not the erase-while-referenced bug.
+        let mut transient_edges = TaskStorage::new();
+        let transient = transient_task(7);
+        transient_edges.upper_mut().insert(transient, 1);
+        assert_eq!(
+            transient_edges.first_dangling_aggregation_edge(|_| true),
+            None
         );
     }
 
@@ -1738,6 +1835,36 @@ mod tests {
             // cell_data is category=data; meta-only drop leaves it alone.
             assert_eq!(storage.cell_data().unwrap().len(), 1);
         }
+    }
+
+    // ==========================================================================
+    // GC soft-deletion
+    // ==========================================================================
+
+    /// The `deleted` marker is a *transient* flag, not Meta, so it survives a Meta `drop_partial`
+    /// (partial eviction). The tombstone + hard-delete logic keys off the flag, so a partial
+    /// eviction between the mark and the commit must not be able to fool it.
+    #[test]
+    fn deleted_marker_is_transient_residue() {
+        let mut storage = TaskStorage::new();
+        storage.flags.set_new_task(false);
+        storage.flags.set_data_restored(true);
+        storage.flags.set_meta_restored(true);
+        assert!(!storage.flags.deleted());
+
+        storage.flags.set_deleted(true);
+        assert!(storage.flags.deleted());
+
+        // A Meta drop_partial (what partial eviction does) must NOT clear the transient marker.
+        let _ = storage.drop_partial(/* data */ false, /* meta */ true);
+        assert!(
+            storage.flags.deleted(),
+            "the `deleted` marker is transient and must survive a Meta drop_partial"
+        );
+
+        // Resurrection clears it.
+        storage.flags.set_deleted(false);
+        assert!(!storage.flags.deleted());
     }
 
     // ==========================================================================
