@@ -8,10 +8,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use turbo_tasks::{
-    GcRoot, ResolvedVc, State, TaskId, TurboTasks, Vc, prevent_gc,
+    GcRoot, ResolvedVc, State, TaskId, Vc, prevent_gc,
     unmark_top_level_task_may_leak_eventually_consistent_state,
 };
-use turbo_tasks_backend::TurboTasksBackend;
 
 use crate::util::create_tt;
 
@@ -153,63 +152,6 @@ async fn select_pinned(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
 #[turbo_tasks::function]
 async fn gc_root_leaf() -> Result<Vc<u32>> {
     Ok(Vc::cell(77))
-}
-
-/// One leaf per index — distinct tasks, so a wide parent accumulates that many distinct children.
-#[turbo_tasks::function]
-fn wide_leaf(index: u32) -> Vc<u32> {
-    Vc::cell(index)
-}
-
-/// Reads `WIDE_FANOUT` distinct children — deliberately above `connect_children`'s 10_000
-/// parallelization threshold, so the child-side `parent_count` bump runs through the chunked,
-/// parallel `process_new_children` path (each chunk on its own worker context) rather than the
-/// serial one.
-const WIDE_FANOUT: u32 = 12_000;
-
-#[turbo_tasks::function(operation, root)]
-async fn wide_parent() -> Result<Vc<u32>> {
-    let mut sum = 0u32;
-    for index in 0..WIDE_FANOUT {
-        sum = sum.wrapping_add(*wide_leaf(index).await?);
-    }
-    Ok(Vc::cell(sum))
-}
-
-/// A selector-gated root over the wide fanout, so flipping disconnects the whole `wide_parent`
-/// subtree cleanly. `wide_parent` has enough children to be promoted to an aggregating node, so
-/// disconnecting it exercises both GC discovery buffers: `wide_parent` loses its last persistent
-/// parent (count-zeroed) and the aggregation-graph rebalance that frees the leaves runs during the
-/// same cascade.
-#[turbo_tasks::function(operation, root)]
-async fn select_wide(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
-    let use_wide = !*selector.await?.get();
-    let value = if use_wide {
-        *wide_parent().connect().await?
-    } else {
-        0u32
-    };
-    Ok(Vc::cell(value))
-}
-
-/// Drives `select_wide` connected, then flips the selector to disconnect the whole `wide_parent`
-/// subtree without invalidating it (so the leaves stay clean and simply lose their parent).
-async fn build_and_disconnect_wide(tt: Arc<TurboTasks<TurboTasksBackend>>) {
-    turbo_tasks::run_once(tt, async move {
-        unmark_top_level_task_may_leak_eventually_consistent_state();
-        let selector_op = create_selector(false);
-        let selector_vc = selector_op.resolve().strongly_consistent().await?;
-        let selector = selector_op.read_strongly_consistent().await?;
-
-        let output = select_wide(selector_vc);
-        output.read_strongly_consistent().await?;
-
-        selector.set(true);
-        output.read_strongly_consistent().await?;
-        anyhow::Ok(())
-    })
-    .await
-    .unwrap();
 }
 
 /// A GC pass collects a disconnected subtree via the parent_count cascade: disconnecting branch_a
