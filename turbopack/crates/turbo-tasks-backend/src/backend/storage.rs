@@ -586,7 +586,7 @@ impl Storage {
     /// - **roots** — durable roots ([`TaskStorage::gc_is_root`]): `parent_count == 0` **and**
     ///   anchored from outside the graph (`transient_ref_count > 0`), such as the pinned
     ///   `ProjectContainer` op or a live endpoint — are returned. GC uses them to maintain the
-    ///   persisted roots map (refresh last-anchored timestamps / age out orphans).
+    ///   persisted roots map (mark still-anchored roots live / age out orphans).
     ///
     /// The two sets are **disjoint**: a `parent_count == 0` task either has an anchor (a root) or
     /// does not (a collectible candidate — ordinary garbage). GC never treats one as both.

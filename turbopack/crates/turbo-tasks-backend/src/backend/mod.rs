@@ -427,7 +427,7 @@ impl TurboTasksBackend {
         self.gc_roots_writes.load(Ordering::Relaxed)
     }
 
-    /// The GC roots set as currently persisted on disk (task id -> last-anchored millis). Reads the
+    /// The GC roots set as currently persisted on disk (task id -> [`TtlCounter`]). Reads the
     /// `GcRoots` infra key directly, so it reflects the last committed snapshot — not any in-flight
     /// pass. Test-only hook for asserting that a root seeded for collection but *not* collected
     /// stays tracked (see `gc_roots_refresh_and_age_out`'s monotonicity note).
@@ -1100,9 +1100,9 @@ impl TurboTasksBackend {
 
         // Hand the GC pass's exclusion straight to the snapshot (`into_snapshot`) so the collected
         // tasks' tombstones (derived from the `deleted` flag) ride this same commit.
-        // The GC roots map (task -> last-anchored-ms), refreshed by the GC pass and persisted in
-        // this same commit. `None` when GC didn't run, so `save_snapshot` leaves the prior
-        // set untouched.
+        // The GC roots map (task -> [`TtlCounter`]), reconciled by the GC pass and persisted in
+        // this same commit. `None` when GC didn't run — or when the reconciled set matched what was
+        // loaded — so `save_snapshot` leaves the prior set untouched.
         let mut gc_roots_to_persist: Option<Vec<(TaskId, TtlCounter)>> = None;
         let mut snapshot_phase = if self.gc_enabled {
             let gc_span = tracing::info_span!(
@@ -1151,9 +1151,11 @@ impl TurboTasksBackend {
             // ...but a GC pass still produced a roots map, and it must be written even though no
             // task changed. Restoring a task does *not* dirty it, so a perfectly cached graph can
             // be restored, observed live and anchored, and leave nothing modified — exactly the
-            // case where the refreshed `last_anchored` timestamps matter. Dropping them here let a
-            // rarely-changing route (an API route restored but never modified) keep a stale
-            // timestamp and age out of the roots map, even though every session had seen it alive.
+            // case where the pass's roots reconciliation matters. Dropping it here let a
+            // rarely-changing route (an API route restored but never modified) keep the
+            // `FirstStale` it picked up in some earlier session and eventually age out of the roots
+            // map, even though every session since had seen it alive and promoted it back to
+            // `MostRecent`.
             //
             // `save_snapshot` handles an empty task list as a no-op scan, so this writes just the
             // small `GcRoots` infra key — the O(N) work is still skipped.

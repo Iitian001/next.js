@@ -40,11 +40,11 @@ enum InfraKey {
     Operations = 0,
     /// The high-water mark for allocating new persistent task ids.
     NextFreeTaskId = 1,
-    /// The persisted GC roots set: `Vec<(TaskId, last_anchored_ms)>`. Each entry is a durable root
-    /// (a persisted task reachable only from outside the persistent graph) and the wall-clock time
-    /// (millis since the Unix epoch) it was last observed anchored. Maintained in the GC phase and
-    /// used to age out roots that have gone un-anchored past the TTL. See `TurboTasksBackend`'s
-    /// roots map.
+    /// The persisted GC roots set: `Vec<(TaskId, TtlCounter)>`. Each entry is a durable root (a
+    /// persisted task reachable only from outside the persistent graph) paired with how long it has
+    /// gone unobserved: `MostRecent` while it is still being anchored, or `FirstStale(ms)` from the
+    /// first session that did not. Maintained in the GC phase and used to age out roots that have
+    /// stayed un-anchored past the TTL. See `TurboTasksBackend`'s roots map.
     GcRoots = 2,
 }
 

@@ -6,6 +6,10 @@
 //! `Arc<dyn TurboTasksApi>`, which erases the concrete backend type and makes `tt.backend()`
 //! unreachable. It also owns the session loop (re-running the body and comparing results), whereas
 //! these tests need to drive snapshots — and sometimes a DB reopen — on their own schedule.
+//!
+//! This module is compiled into each test binary separately, so any helper a given binary doesn't
+//! call reads as dead code there.
+#![allow(dead_code)]
 
 use std::{path::Path, sync::Arc};
 
@@ -46,15 +50,28 @@ fn open_tt_at(path: &Path, num_workers: usize) -> Arc<TurboTasks<TurboTasksBacke
     ))
 }
 
+/// A persistence directory that outlives the backends opened on it, so a test can stop one backend
+/// and open another on the same path to simulate a restart. Pair with [`reopen_tt`].
+pub fn create_persistence_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("{name}-"))
+        .tempdir()
+        .unwrap()
+}
+
+/// Opens a backend on an existing persistence directory — a new *session* over the same database.
+/// The previous backend must already be stopped (`stop_and_wait`) so its shutdown snapshot has been
+/// flushed.
+pub fn reopen_tt(dir: &tempfile::TempDir) -> Arc<TurboTasks<TurboTasksBackend>> {
+    open_tt_at(dir.path(), 2)
+}
+
 /// A fresh persistent backend in its own temp directory, with `num_workers` workers.
 pub fn create_tt_with_workers(
     name: &str,
     num_workers: usize,
 ) -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
-    let dir = tempfile::Builder::new()
-        .prefix(&format!("{name}-"))
-        .tempdir()
-        .unwrap();
+    let dir = create_persistence_dir(name);
     let tt = open_tt_at(dir.path(), num_workers);
     (tt, dir)
 }
