@@ -46,6 +46,7 @@ import type { ServerRuntime } from '../types'
 import {
   normalizeAppPath,
   compareAppPaths,
+  selectAppPageEntry,
 } from '../shared/lib/router/utils/app-paths'
 import { encodeMatchers } from './webpack/loaders/next-middleware-loader'
 import type { EdgeFunctionLoaderOptions } from './webpack/loaders/next-edge-function-loader'
@@ -514,6 +515,19 @@ export async function createEntrypoints(
       const isInstrumentation =
         isInstrumentationHookFile(page) && pagesType === PAGE_TYPES.ROOT
 
+      const matchedAppPaths =
+        pagesType === PAGE_TYPES.APP
+          ? (appPathsPerRoute[normalizeAppPath(page)] ?? null)
+          : null
+      const normalizedAppPage = normalizeAppPath(page)
+      const isFinalRouteMatcher =
+        config.experimental.strictRouteMatching &&
+        matchedAppPaths?.length &&
+        matchedAppPaths.some(
+          (appPath) => normalizeAppPath(appPath) === normalizedAppPage
+        ) &&
+        selectAppPageEntry(normalizedAppPage, matchedAppPaths) === page
+
       runDependingOnPageType({
         page,
         pageRuntime: staticInfo.runtime,
@@ -531,7 +545,6 @@ export async function createEntrypoints(
         },
         onServer: () => {
           if (pagesType === 'app' && appDir) {
-            const matchedAppPaths = appPathsPerRoute[normalizeAppPath(page)]
             server[serverBundlePath] = getAppEntry({
               page,
               name: serverBundlePath,
@@ -552,6 +565,10 @@ export async function createEntrypoints(
                 .explicitParallelRouteChildren
                 ? true
                 : undefined,
+              strictRouteMatching: config.experimental.strictRouteMatching
+                ? true
+                : undefined,
+              isFinalRouteMatcher: isFinalRouteMatcher ? true : undefined,
             })
           } else if (isInstrumentation) {
             server[serverBundlePath.replace('src/', '')] =
@@ -614,7 +631,6 @@ export async function createEntrypoints(
               })
           } else {
             if (pagesType === 'app') {
-              const matchedAppPaths = appPathsPerRoute[normalizeAppPath(page)]
               appDirLoader = getAppEntry({
                 name: serverBundlePath,
                 page,
@@ -639,6 +655,10 @@ export async function createEntrypoints(
                   .explicitParallelRouteChildren
                   ? true
                   : undefined,
+                strictRouteMatching: config.experimental.strictRouteMatching
+                  ? true
+                  : undefined,
+                isFinalRouteMatcher: isFinalRouteMatcher ? true : undefined,
               }).import
             }
             edgeServer[serverBundlePath] = getEdgeServerEntry({
