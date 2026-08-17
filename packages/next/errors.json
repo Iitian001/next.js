@@ -1498,5 +1498,7 @@
   "1497": "Expected at least one selectable metadata branch",
   "1498": "Expected at least one metadata branch",
   "1499": "Expected selected metadata branch to end at a leaf",
-  "1500": "Expected selected metadata branch to match loader tree"
+  "1500": "Expected selected metadata branch to match loader tree",
+  "1501": "Expected unstable_selectMetadata to return a metadata handle, selection, or SelectedMetadata object",
+  "1502": "Expected unstable_selectViewport to return a viewport handle, selection, or ResolvedViewport object"
 }
