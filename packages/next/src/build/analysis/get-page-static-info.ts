@@ -48,7 +48,7 @@ import { normalizePagePath } from '../../shared/lib/page-path/normalize-page-pat
 import { isProxyFile } from '../utils'
 
 const PARSE_PATTERN =
-  /(?<!(_jsx|jsx-))runtime|preferredRegion|getStaticProps|getServerSideProps|generateStaticParams|export const|generateImageMetadata|generateSitemaps|middleware|proxy/
+  /(?<!(_jsx|jsx-))runtime|preferredRegion|getStaticProps|getServerSideProps|generateStaticParams|experimental_paramMatching|experimental_generateParamMatching|export const|generateImageMetadata|generateSitemaps|middleware|proxy/
 
 export type ProxyMatcher = {
   regexp: string
@@ -187,6 +187,8 @@ function checkExports(
   getServerSideProps?: boolean
   generateImageMetadata?: boolean
   generateSitemaps?: boolean
+  prerenderMatcher?: boolean
+  generatePrerenderMatcher?: boolean
   generateStaticParams?: boolean
   directives?: Set<string>
   exports?: Set<string>
@@ -196,6 +198,8 @@ function checkExports(
     'getServerSideProps',
     'generateImageMetadata',
     'generateSitemaps',
+    'experimental_paramMatching',
+    'experimental_generateParamMatching',
     'generateStaticParams',
   ])
   if (!Array.isArray(ast?.body)) {
@@ -207,6 +211,8 @@ function checkExports(
     let getServerSideProps: boolean = false
     let generateImageMetadata: boolean = false
     let generateSitemaps: boolean = false
+    let prerenderMatcher = false
+    let generatePrerenderMatcher = false
     let generateStaticParams = false
     let exports = new Set<string>()
     let directives = new Set<string>()
@@ -251,6 +257,10 @@ function checkExports(
         getStaticProps = id === 'getStaticProps'
         generateImageMetadata = id === 'generateImageMetadata'
         generateSitemaps = id === 'generateSitemaps'
+        if (id === 'experimental_paramMatching') prerenderMatcher = true
+        if (id === 'experimental_generateParamMatching') {
+          generatePrerenderMatcher = true
+        }
         generateStaticParams = id === 'generateStaticParams'
       }
 
@@ -264,6 +274,10 @@ function checkExports(
           getStaticProps = id === 'getStaticProps'
           generateImageMetadata = id === 'generateImageMetadata'
           generateSitemaps = id === 'generateSitemaps'
+          if (id === 'experimental_paramMatching') prerenderMatcher = true
+          if (id === 'experimental_generateParamMatching') {
+            generatePrerenderMatcher = true
+          }
           generateStaticParams = id === 'generateStaticParams'
         }
       }
@@ -288,6 +302,15 @@ function checkExports(
             if (!generateSitemaps && value === 'generateSitemaps') {
               generateSitemaps = true
             }
+            if (!prerenderMatcher && value === 'experimental_paramMatching') {
+              prerenderMatcher = true
+            }
+            if (
+              !generatePrerenderMatcher &&
+              value === 'experimental_generateParamMatching'
+            ) {
+              generatePrerenderMatcher = true
+            }
             if (!generateStaticParams && value === 'generateStaticParams') {
               generateStaticParams = true
             }
@@ -308,6 +331,8 @@ function checkExports(
       getServerSideProps,
       generateImageMetadata,
       generateSitemaps,
+      prerenderMatcher,
+      generatePrerenderMatcher,
       generateStaticParams,
       directives,
       exports,
@@ -654,6 +679,8 @@ export async function getAppPageStaticInfo({
   })
 
   const {
+    prerenderMatcher,
+    generatePrerenderMatcher,
     generateStaticParams,
     generateImageMetadata,
     generateSitemaps,
@@ -684,6 +711,38 @@ export async function getAppPageStaticInfo({
 
   const route = normalizeAppPath(page)
   const config = parseAppSegmentConfig(exportedConfig, route)
+
+  const hasPrerenderMatcher = prerenderMatcher || generatePrerenderMatcher
+
+  if (hasPrerenderMatcher && !nextConfig.experimental?.paramMatching) {
+    throw new Error(
+      `Page "${page}" exports experimental parameter matching, but the experimental \`paramMatching\` flag is not enabled in next.config.`
+    )
+  }
+
+  if (prerenderMatcher && generatePrerenderMatcher) {
+    throw new Error(
+      `Page "${page}" cannot export both \`experimental_paramMatching\` and \`experimental_generateParamMatching\`.`
+    )
+  }
+
+  if (hasPrerenderMatcher && /\/route\.[^/]+$/.test(pageFilePath)) {
+    throw new Error(
+      `Route "${page}" cannot export experimental parameter matching. It is only supported in layouts and pages.`
+    )
+  }
+
+  if (isEdgeRuntime(config.runtime) && hasPrerenderMatcher) {
+    throw new Error(
+      `Page "${page}" cannot use both \`export const runtime = 'edge'\` and experimental parameter matching.`
+    )
+  }
+
+  if (directives?.has('client') && hasPrerenderMatcher) {
+    throw new Error(
+      `Page "${page}" cannot use both "use client" and an experimental parameter matching export.`
+    )
+  }
 
   // Prevent edge runtime and generateStaticParams in the same file.
   if (isEdgeRuntime(config.runtime) && generateStaticParams) {
