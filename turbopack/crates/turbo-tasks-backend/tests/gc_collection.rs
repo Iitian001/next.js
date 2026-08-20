@@ -50,58 +50,6 @@ async fn root_with_child(n: u32) -> Result<Vc<u32>> {
     Ok(Vc::cell(*orphan_leaf(n).await? + 1))
 }
 
-// --- Diamond fixture for the cross-session disk-only forward-dep scrub test ---
-//
-// A "diamond": a reader `A` (`diamond_reader`) holds a **forward cell-dependency** on a target `B`
-// (`diamond_target`) that is *not* its child — `B` is called by the root and its resolved `Vc` is
-// passed into `A`, so reading it records a dep edge without a child edge. Both `A` and `B` are
-// children of the diamond root. This is the shape that, cross-session under GC, can require
-// scrubbing a **disk-only** forward-dep target: when the orphaned root is collected, `A` and `B`
-// cascade together, and `A`'s `CleanupOldEdges` may open `B` to remove the stale reverse edge while
-// `B` has not yet been restored from disk this session.
-//
-// The target must be **mutable** to record dependents at all (an immutable constant records none),
-// so it reads a long-lived `State` whose value never changes.
-
-#[turbo_tasks::value(transparent)]
-struct Constant(State<u32>);
-
-#[turbo_tasks::function(operation, root)]
-fn create_constant() -> Vc<Constant> {
-    Constant(State::new(0)).cell()
-}
-
-/// The forward-dependency *target* `B`. Reading `constant`'s `State` makes it mutable so a reader
-/// records a real `cell_dependents` reverse edge on it.
-#[turbo_tasks::function]
-async fn diamond_target(constant: ResolvedVc<Constant>, index: u32) -> Result<Vc<u32>> {
-    let base = *constant.await?.get();
-    Ok(Vc::cell(base.wrapping_add(index).wrapping_mul(7)))
-}
-
-/// The diamond *reader* `A`: reads the cell of a `diamond_target` (`B`) passed in as an
-/// already-resolved `Vc`, so `A` forward-deps on `B` without parenting it.
-#[turbo_tasks::function]
-async fn diamond_reader(target: ResolvedVc<u32>) -> Result<Vc<u32>> {
-    Ok(Vc::cell(1 + *target.await?))
-}
-
-const DIAMOND_FANOUT: u32 = 64;
-
-/// The diamond root: for each index, calls `diamond_target(index)` (`B`, the root's child) and
-/// `diamond_reader(B)` (`A`, the root's child that forward-deps on `B`). `FANOUT` distinct A/B
-/// pairs give many chances for the racing interleaving where an `A` scrubs a not-yet-restored `B`.
-#[turbo_tasks::function(operation, root)]
-async fn diamond_root(constant: ResolvedVc<Constant>) -> Result<Vc<u32>> {
-    let mut sum = 0u32;
-    for index in 0..DIAMOND_FANOUT {
-        let target = diamond_target(*constant, index).to_resolved().await?;
-        sum = sum.wrapping_add(*target.await?);
-        sum = sum.wrapping_add(*diamond_reader(*target).await?);
-    }
-    Ok(Vc::cell(sum))
-}
-
 #[turbo_tasks::function]
 async fn branch_a() -> Result<Vc<u32>> {
     Ok(Vc::cell(1 + *leaf(10).await?))
