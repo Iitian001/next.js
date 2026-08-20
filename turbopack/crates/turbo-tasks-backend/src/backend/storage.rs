@@ -566,15 +566,6 @@ impl Storage {
 
     /// Scans a **single** shard by index, invoking `on_candidate` for each resident, non-transient
     /// task whose storage passes the cheap [`TaskStorage::gc_maybe_collectible`] pre-filter.
-    ///
-    /// `on_candidate` runs while the shard **read lock is held**, so it must be cheap and must not
-    /// re-enter the map.
-    ///
-    /// The scan only sees resident tasks; disk-only garbage is collected after it is next restored.
-    ///
-    /// # Panics
-    ///
-    /// If `index >= self.shard_count()`.
     pub fn gc_scan_shard(&self, index: usize, mut on_candidate: impl FnMut(TaskId)) {
         let shard = self.map.shards()[index].read();
         // SAFETY: we hold the shard read lock for the duration of iteration.

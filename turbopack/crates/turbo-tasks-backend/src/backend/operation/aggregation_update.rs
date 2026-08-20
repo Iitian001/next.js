@@ -1453,8 +1453,18 @@ impl AggregationUpdateQueue {
                 }
                 AggregationUpdateJob::AdjustParentCount { task_ids, delta } => {
                     ctx.for_each_task_meta(task_ids, "AdjustParentCount", |mut task, ctx| {
+                        // Losing the last persistent parent is the usual way a task becomes
+                        // garbage, so check the full predicate here — but only on the decrement
+                        // that actually reaches 0, since a task above 0 can never satisfy it.
                         if task.update_and_get_parent_count(delta) == 0 {
-                            ctx.note_gc_parent_count_zeroed(task.id());
+                            debug_assert!(
+                                !task.id().is_transient(),
+                                "a transient task should never have a persistent parent_count to \
+                                 zero"
+                            );
+                            if task.is_gc_collectible() {
+                                ctx.note_gc_collectible(task.id());
+                            }
                         }
                     });
                 }
@@ -1932,9 +1942,10 @@ impl AggregationUpdateQueue {
                 if removed_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
-                    // Last upper edge lost — may have newly become GC-collectible.
-                    if follower.is_upper_empty() {
-                        ctx.note_gc_edge_loss_candidate(lost_follower_id);
+                    // Losing the last upper edge can satisfy the aggregation-emptiness clauses of
+                    // the GC predicate, so re-check it here under the guard we already hold.
+                    if follower.is_upper_empty() && follower.is_gc_collectible() {
+                        ctx.note_gc_collectible(lost_follower_id);
                     }
                     drop(follower);
 
@@ -2012,9 +2023,10 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
-                    // Last follower edge lost — may have newly become GC-collectible.
-                    if upper.is_followers_empty() {
-                        ctx.note_gc_edge_loss_candidate(upper_id);
+                    // Losing the last follower edge can satisfy the aggregation-emptiness clauses
+                    // of the GC predicate, so re-check it here under the guard we already hold.
+                    if upper.is_followers_empty() && upper.is_gc_collectible() {
+                        ctx.note_gc_collectible(upper_id);
                     }
                     drop(upper);
 
@@ -2114,9 +2126,10 @@ impl AggregationUpdateQueue {
             if !removed_uppers.is_empty() {
                 let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                 let followers = get_followers(&follower);
-                // Last upper edge lost — may have newly become GC-collectible.
-                if follower.is_upper_empty() {
-                    ctx.note_gc_edge_loss_candidate(lost_follower_id);
+                // Losing the last upper edge can satisfy the aggregation-emptiness clauses of
+                // the GC predicate, so re-check it here under the guard we already hold.
+                if follower.is_upper_empty() && follower.is_gc_collectible() {
+                    ctx.note_gc_collectible(lost_follower_id);
                 }
                 drop(follower);
 
@@ -2198,9 +2211,10 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
-                    // Last follower edge lost — may have newly become GC-collectible.
-                    if upper.is_followers_empty() {
-                        ctx.note_gc_edge_loss_candidate(upper_id);
+                    // Losing the last follower edge can satisfy the aggregation-emptiness clauses
+                    // of the GC predicate, so re-check it here under the guard we already hold.
+                    if upper.is_followers_empty() && upper.is_gc_collectible() {
+                        ctx.note_gc_collectible(upper_id);
                     }
                     drop(upper);
 
@@ -2310,9 +2324,10 @@ impl AggregationUpdateQueue {
                 if remove_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
-                    // Last upper edge lost — may have newly become GC-collectible.
-                    if follower.is_upper_empty() {
-                        ctx.note_gc_edge_loss_candidate(lost_follower_id);
+                    // Losing the last upper edge can satisfy the aggregation-emptiness clauses of
+                    // the GC predicate, so re-check it here under the guard we already hold.
+                    if follower.is_upper_empty() && follower.is_gc_collectible() {
+                        ctx.note_gc_collectible(lost_follower_id);
                     }
                     drop(follower);
 
@@ -2395,9 +2410,10 @@ impl AggregationUpdateQueue {
                 let has_active_count = ctx.should_track_activeness()
                     && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                 let upper_ids = get_uppers(&upper);
-                // Last follower edge lost — may have newly become GC-collectible.
-                if upper.is_followers_empty() {
-                    ctx.note_gc_edge_loss_candidate(upper_id);
+                // Losing the last follower edge can satisfy the aggregation-emptiness clauses
+                // of the GC predicate, so re-check it here under the guard we already hold.
+                if upper.is_followers_empty() && upper.is_gc_collectible() {
+                    ctx.note_gc_collectible(upper_id);
                 }
                 drop(upper);
 

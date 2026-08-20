@@ -136,24 +136,19 @@ pub trait ExecuteContext<'e>: Sized {
     fn operation_suspend_point<T>(&mut self, op: &T)
     where
         T: Clone + Into<AnyOperation>;
-    /// Records that `task_id`'s persistent `parent_count` just reached 0 (it lost its last
-    /// persistent parent). Only a GC context accumulates these; a normal operation context
-    /// discards them. The collecting job drains them via [`Self::take_gc_parent_count_zeroed`] to
-    /// re-check collectibility and cascade a `Collect`.
-    fn note_gc_parent_count_zeroed(&mut self, task_id: TaskId);
-    /// Takes the ids recorded by [`Self::note_gc_parent_count_zeroed`] since the last call. Empty
-    /// outside a GC context.
-    fn take_gc_parent_count_zeroed(&mut self) -> Vec<TaskId>;
-    /// Records that `task_id` just lost its last aggregation edge (its `upper` or `followers` set
-    /// became empty) during an edge-removal cascade. Unlike [`Self::note_gc_parent_count_zeroed`]
-    /// this does *not* imply the task lost a persistent parent — its `parent_count` is unchanged —
-    /// only that it may have *newly* satisfied the aggregation-emptiness clauses of
-    /// [`is_gc_collectible`](super::TaskGuard::is_gc_collectible). Only a GC context accumulates
-    /// these; a normal operation context discards them.
-    fn note_gc_edge_loss_candidate(&mut self, task_id: TaskId);
-    /// Takes the ids recorded by [`Self::note_gc_edge_loss_candidate`] since the last call. Empty
-    /// outside a GC context.
-    fn take_gc_edge_loss_candidates(&mut self) -> Vec<TaskId>;
+    /// Records that `task_id` satisfied
+    /// [`is_gc_collectible`](super::TaskGuard::is_gc_collectible) at the moment one of that
+    /// predicate's clauses changed in its favor — it lost its last persistent parent
+    /// (`parent_count` reached 0), or its last aggregation edge (`upper` / `followers` became
+    /// empty). Callers evaluate the predicate under the guard they already hold on `task_id`, so
+    /// the collecting job can spawn a `Collect` for each id straight out of
+    /// [`Self::take_gc_collectible`] without re-opening it.
+    ///
+    /// Only a GC context accumulates these; a normal operation context discards them.
+    fn note_gc_collectible(&mut self, task_id: TaskId);
+    /// Takes the ids recorded by [`Self::note_gc_collectible`] since the last call. Empty outside
+    /// a GC context.
+    fn take_gc_collectible(&mut self) -> Vec<TaskId>;
     /// In the GC context only, whether `task_id` is currently resident: `Some(false)` means opening
     /// it via [`Self::task`] would restore it from disk. Under the GC phase that must never happen
     /// — a collected task stays resident (soft-deleted) precisely so a forward-dep scrub or cascade
@@ -236,17 +231,13 @@ pub struct ExecuteContextImpl<'e> {
     turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
     _operation_guard: Option<OperationGuard<'e, AnyOperation>>,
     task_lock_counter: TaskLockCounter,
-    /// GC-only: ids whose persistent `parent_count` reached 0 during this context's operations.
-    /// `None` for normal contexts, which makes the recording hook a no-op. See
-    /// [`ExecuteContext::note_gc_parent_count_zeroed`].
-    // TODO: hand newly-parentless children to the collector via callback instead of buffering, for
+    /// GC-only: ids that became GC-collectible during this context's operations. `None` for normal
+    /// contexts, which makes the recording hook a no-op. See
+    /// [`ExecuteContext::note_gc_collectible`].
+    // TODO: hand newly-collectible tasks to the collector via callback instead of buffering, for
     // lower latency. Needs guard/lock-ordering review first: spawning mid-cleanup starts a child's
     // collection while the parent still holds guards.
-    gc_zeroed: Option<Vec<TaskId>>,
-    /// GC-only: ids whose last aggregation edge (`upper` or `followers`) was removed during this
-    /// context's operations. `None` for normal contexts. See
-    /// [`ExecuteContext::note_gc_edge_loss_candidate`].
-    gc_edge_loss: Option<Vec<TaskId>>,
+    gc_collectible: Option<Vec<TaskId>>,
 }
 
 impl<'e> ExecuteContextImpl<'e> {
@@ -259,8 +250,7 @@ impl<'e> ExecuteContextImpl<'e> {
             turbo_tasks,
             _operation_guard: Some(backend.start_operation()),
             task_lock_counter: TaskLockCounter::new(),
-            gc_zeroed: None,
-            gc_edge_loss: None,
+            gc_collectible: None,
         }
     }
 
@@ -282,8 +272,7 @@ impl<'e> ExecuteContextImpl<'e> {
             turbo_tasks,
             _operation_guard: None,
             task_lock_counter: TaskLockCounter::new(),
-            gc_zeroed: Some(Vec::new()),
-            gc_edge_loss: Some(Vec::new()),
+            gc_collectible: Some(Vec::new()),
         }
     }
 
@@ -1201,37 +1190,24 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
         self.backend.operation_suspend_point(|| op.clone().into());
     }
 
-    fn note_gc_parent_count_zeroed(&mut self, task_id: TaskId) {
-        if let Some(zeroed) = self.gc_zeroed.as_mut() {
-            zeroed.push(task_id);
+    fn note_gc_collectible(&mut self, task_id: TaskId) {
+        if let Some(collectible) = self.gc_collectible.as_mut() {
+            collectible.push(task_id);
         }
     }
 
-    fn take_gc_parent_count_zeroed(&mut self) -> Vec<TaskId> {
-        self.gc_zeroed
+    fn take_gc_collectible(&mut self) -> Vec<TaskId> {
+        self.gc_collectible
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
     }
 
     fn gc_target_resident(&self, task_id: TaskId) -> Option<bool> {
-        // Only the GC context (the one collecting zeroed ids) reports residency.
-        self.gc_zeroed
+        // Only the GC context (the one collecting collectible ids) reports residency.
+        self.gc_collectible
             .is_some()
             .then(|| self.backend.storage.with_task(task_id, |_| ()).is_some())
-    }
-
-    fn note_gc_edge_loss_candidate(&mut self, task_id: TaskId) {
-        if let Some(candidates) = self.gc_edge_loss.as_mut() {
-            candidates.push(task_id);
-        }
-    }
-
-    fn take_gc_edge_loss_candidates(&mut self) -> Vec<TaskId> {
-        self.gc_edge_loss
-            .as_mut()
-            .map(std::mem::take)
-            .unwrap_or_default()
     }
 
     fn should_track_dependencies(&self) -> bool {
@@ -1293,8 +1269,7 @@ impl<'e> ChildExecuteContext<'e> for ChildExecuteContextImpl<'e> {
             turbo_tasks: self.turbo_tasks,
             _operation_guard: None,
             task_lock_counter: TaskLockCounter::new(),
-            gc_zeroed: None,
-            gc_edge_loss: None,
+            gc_collectible: None,
         }
     }
 }
@@ -1900,7 +1875,7 @@ pub use self::{
         AggregatedDataUpdate, AggregationUpdateJob, get_aggregation_number, get_uppers,
         is_aggregating_node, is_root_node,
     },
-    cleanup_old_edges::OutdatedEdge,
+    cleanup_old_edges::{OutdatedEdge, capture_all_outgoing_edges},
     connect_children::connect_children,
     invalidate::make_task_dirty_internal,
     prepare_new_children::prepare_new_children,

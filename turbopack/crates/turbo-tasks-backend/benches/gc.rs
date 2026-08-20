@@ -27,10 +27,7 @@ fn enabled() -> bool {
     )
 }
 
-/// A persistent backend with GC-relevant options. Each benchmark iteration gets a fresh one (the
-/// `TempDir` is returned so it lives as long as the backend). GC is invoked directly via
-/// `gc_for_testing`, which does not consult the `TURBO_ENGINE_GC` env var, so nothing global needs
-/// setting.
+/// A persistent backend with GC-relevant options
 fn create_tt() -> (Arc<TurboTasks<TurboTasksBackend>>, tempfile::TempDir) {
     let parent = std::path::PathBuf::from(format!("{}/.cache", env!("CARGO_TARGET_TMPDIR")));
     std::fs::create_dir_all(&parent).unwrap();
