@@ -98,6 +98,23 @@ describe('experimental parameter matching', () => {
       )
     })
 
+    it('prints the effective matching and deployment-pattern digest', () => {
+      expect(next.cliOutput).toContain('Experimental parameter matching')
+      expect(next.cliOutput).toContain(
+        'not-found  /[lang]/catalog/[top]/items/[bottom]'
+      )
+      expect(next.cliOutput).toContain(
+        'blocking   /en/catalog/[top]/items/[bottom]'
+      )
+      expect(next.cliOutput).toContain(
+        'fallback   /en/catalog/t1/items/[bottom]'
+      )
+      expect(next.cliOutput).toContain('prerender  /en/catalog/t1/items/b1')
+      expect(next.cliOutput).toContain('/inferred-empty/[top]/items/[bottom]')
+      expect(next.cliOutput).toContain('Emitted dynamic route patterns')
+      expect(next.cliOutput).toContain('/[lang]/catalog/[top]/items/[bottom] (')
+    })
+
     it('uses the existing fallback-false adapter routing contract', async () => {
       const { routing } = JSON.parse(
         await next.readFile('build-complete.json')
