@@ -149,12 +149,6 @@ pub trait ExecuteContext<'e>: Sized {
     /// Takes the ids recorded by [`Self::note_gc_collectible`] since the last call. Empty outside
     /// a GC context.
     fn take_gc_collectible(&mut self) -> Vec<TaskId>;
-    /// In the GC context only, whether `task_id` is currently resident: `Some(false)` means opening
-    /// it via [`Self::task`] would restore it from disk. Under the GC phase that must never happen
-    /// — a collected task stays resident (soft-deleted) precisely so a forward-dep scrub or cascade
-    /// finds a live entry rather than resurrecting a zombie — so GC-only callers `debug_assert`
-    /// against it. `None` for every normal context, which disables the assertion there.
-    fn gc_target_resident(&self, task_id: TaskId) -> Option<bool>;
     fn should_track_dependencies(&self) -> bool;
     fn should_track_activeness(&self) -> bool;
     fn turbo_tasks(&self) -> Arc<dyn TurboTasksCallApi>;
@@ -1201,13 +1195,6 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
-    }
-
-    fn gc_target_resident(&self, task_id: TaskId) -> Option<bool> {
-        // Only the GC context (the one collecting collectible ids) reports residency.
-        self.gc_collectible
-            .is_some()
-            .then(|| self.backend.storage.with_task(task_id, |_| ()).is_some())
     }
 
     fn should_track_dependencies(&self) -> bool {
