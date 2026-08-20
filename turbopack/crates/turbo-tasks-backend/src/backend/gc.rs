@@ -118,8 +118,6 @@ impl TurboTasksBackend {
         )
     }
 
-    /// Body of [`Backend::pin_task_for_gc`](turbo_tasks::backend::Backend::pin_task_for_gc); the
-    /// trait method in `mod.rs` delegates here.
     pub(super) fn gc_pin(&self, task: TaskId, turbo_tasks: &TurboTasks<TurboTasksBackend>) {
         // Once stopping, GC bookkeeping is irrelevant
         if self.stopping.load(Ordering::Acquire) {
@@ -137,8 +135,6 @@ impl TurboTasksBackend {
         }
     }
 
-    /// Body of [`Backend::unpin_task_for_gc`](turbo_tasks::backend::Backend::unpin_task_for_gc);
-    /// the trait method in `mod.rs` delegates here.
     pub(super) fn gc_unpin(&self, task: TaskId, turbo_tasks: &TurboTasks<TurboTasksBackend>) {
         // See `gc_pin`: no-op once stopping, so handles finalized during shutdown (after the map is
         // dropped) don't underflow the count.
@@ -157,10 +153,7 @@ impl TurboTasksBackend {
         }
     }
 
-    /// Runs a full GC pass under the GC phase and returns the number of tasks collected (marked
-    /// soft-deleted). The tombstones are derived by a subsequent snapshot from the `deleted` flag
-    /// (production runs GC inline in `snapshot_and_persist`). Test-only hook; callers must be idle
-    /// (no task executing).
+    /// Runs a full GC pass under the GC phase and returns the number of tasks collected.
     #[doc(hidden)]
     pub fn gc_for_testing(&self, turbo_tasks: &TurboTasks<TurboTasksBackend>) -> usize {
         let _serialize = self.snapshot_in_progress.lock();

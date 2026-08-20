@@ -131,19 +131,12 @@ pub trait ExecuteContext<'e>: Sized {
         task_id2: TaskId,
         category: TaskDataCategory,
     ) -> (Self::TaskGuardImpl, Self::TaskGuardImpl);
-    fn schedule_task(&self, task: Self::TaskGuardImpl, parent_priority: TaskPriority);
+    fn schedule_task(&self, task: &Self::TaskGuardImpl, parent_priority: TaskPriority);
     fn get_current_task_priority(&self) -> TaskPriority;
     fn operation_suspend_point<T>(&mut self, op: &T)
     where
         T: Clone + Into<AnyOperation>;
-    /// Records that `task_id` satisfied
-    /// [`is_gc_collectible`](super::TaskGuard::is_gc_collectible) at the moment one of that
-    /// predicate's clauses changed in its favor — it lost its last persistent parent
-    /// (`parent_count` reached 0), or its last aggregation edge (`upper` / `followers` became
-    /// empty). Callers evaluate the predicate under the guard they already hold on `task_id`, so
-    /// the collecting job can spawn a `Collect` for each id straight out of
-    /// [`Self::take_gc_collectible`] without re-opening it.
-    ///
+    /// Use to record tasks that become collectible during execution of this context.
     /// Only a GC context accumulates these; a normal operation context discards them.
     fn note_gc_collectible(&mut self, task_id: TaskId);
     /// Takes the ids recorded by [`Self::note_gc_collectible`] since the last call. Empty outside
@@ -225,12 +218,7 @@ pub struct ExecuteContextImpl<'e> {
     turbo_tasks: &'e TurboTasks<TurboTasksBackend>,
     _operation_guard: Option<OperationGuard<'e, AnyOperation>>,
     task_lock_counter: TaskLockCounter,
-    /// GC-only: ids that became GC-collectible during this context's operations. `None` for normal
-    /// contexts, which makes the recording hook a no-op. See
-    /// [`ExecuteContext::note_gc_collectible`].
-    // TODO: hand newly-collectible tasks to the collector via callback instead of buffering, for
-    // lower latency. Needs guard/lock-ordering review first: spawning mid-cleanup starts a child's
-    // collection while the parent still holds guards.
+    /// GC-only: ids that became GC-collectible during this context's operations.
     gc_collectible: Option<Vec<TaskId>>,
 }
 
@@ -1155,7 +1143,7 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
         )
     }
 
-    fn schedule_task(&self, task: Self::TaskGuardImpl, parent_priority: TaskPriority) {
+    fn schedule_task(&self, task: &Self::TaskGuardImpl, parent_priority: TaskPriority) {
         let priority = if task.has_output() {
             TaskPriority::invalidation(
                 task.get_leaf_distance()
@@ -1175,9 +1163,7 @@ impl<'e> ExecuteContext<'e> for ExecuteContextImpl<'e> {
     }
 
     fn operation_suspend_point<T: Clone + Into<AnyOperation>>(&mut self, op: &T) {
-        // The GC context holds no operation guard: the GC phase already owns the coordinator's
-        // exclusion, so there is nothing to yield to and `suspend_point` (which decrements the
-        // in-progress-operations count it never incremented) must not run. Skip it entirely.
+        // suspend guards become no-ops under GC
         if self._operation_guard.is_none() {
             return;
         }
@@ -1302,6 +1288,20 @@ impl Display for TaskType {
 pub trait TaskGuard: Debug + TaskStorageAccessors {
     fn id(&self) -> TaskId;
 
+    fn access(&self) -> Option<TaskDataCategory>;
+    fn downgrade_access(&mut self, access: Option<TaskDataCategory>);
+
+    /// Asserts this task has not been GC-collected.
+    #[track_caller]
+    #[inline]
+    fn assert_not_deleted(&self, operation: &str) {
+        debug_assert!(
+            !self.deleted(),
+            "{operation} on GC-deleted task {} — a resurrection path was missed",
+            self.id()
+        );
+    }
+
     /// GC-only: for a collected task that was never persisted (`new_task`), clear its modified bits
     /// and shard modified count so the next snapshot skips it (nothing on disk to tombstone).
     /// See [`crate::backend::storage::StorageWriteGuard::discard_modifications_for_gc_new_task`].
@@ -1374,20 +1374,16 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
         new_value
     }
 
-    /// Whether a GC pass may collect this task: it is non-transient, has no persistent or transient
+    /// Whether a GC pass may collect this task:
+    ///
+    /// It is collectible if it is non-transient, has no persistent or transient
     /// parents, is quiescent (not active, not in progress), and holds no aggregation edges
     /// (`upper`/`followers`).
-    ///
-    /// The storage-only checks live in [`TaskStorage::gc_maybe_collectible`] so GC's resident-map
-    /// scan can reuse them without a guard; this authoritative form adds the transient-*id* check
-    /// and enforces Meta-restoration (`check_access`) — the fields it reads are lazy Meta fields
-    /// that read as absent (0/empty) when Meta was evicted, so a task with evicted Meta must not be
-    /// judged collectible from stale absence.
     fn is_gc_collectible(&self) -> bool {
         // Transient-ness is a property of the id, not the storage; transient tasks are never
         // collected.
         !self.id().is_transient() && {
-            self.check_access(crate::backend::storage::SpecificTaskDataCategory::Meta);
+            self.check_access(SpecificTaskDataCategory::Meta);
             self.typed().gc_maybe_collectible()
         }
     }
@@ -1638,11 +1634,7 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
 pub struct TaskGuardImpl<'a> {
     task_id: TaskId,
     task: StorageWriteGuard<'a>,
-    /// Which category was restored when this guard was opened, gating `check_access`. `None` means
-    /// **no** category was restored (e.g. the non-inserting [`ExecuteContext::resident_task`]
-    /// path, used for transient-only bookkeeping): any Meta/Data access through such a guard
-    /// is a bug and `check_access` rejects it. Transient-field accessors never call
-    /// `check_access`, so they work regardless.
+    // None means no categories are accessible other than transient data.
     #[cfg(debug_assertions)]
     category: Option<TaskDataCategory>,
     task_lock_counter: TaskLockCounter,
@@ -1659,7 +1651,7 @@ impl TaskGuardImpl<'_> {
     /// before accessing the data.
     #[inline]
     #[track_caller]
-    fn check_access(&self, category: crate::backend::storage::SpecificTaskDataCategory) {
+    fn check_access(&self, category: SpecificTaskDataCategory) {
         match category {
             SpecificTaskDataCategory::Data => {
                 #[cfg(debug_assertions)]
@@ -1703,6 +1695,31 @@ impl Debug for TaskGuardImpl<'_> {
 impl TaskGuard for TaskGuardImpl<'_> {
     fn id(&self) -> TaskId {
         self.task_id
+    }
+
+    fn access(&self) -> Option<TaskDataCategory> {
+        #[cfg(debug_assertions)]
+        {
+            self.category
+        }
+    }
+
+    fn downgrade_access(&mut self, access: Option<TaskDataCategory>) {
+        #[cfg(debug_assertions)]
+        {
+            match (self.category, access) {
+                (Some(current_access), Some(new_access)) if current_access >= new_access => {
+                    self.category = Some(new_access);
+                }
+                (_, None) => {
+                    // Downgrade to none is always safe
+                    self.category = None;
+                }
+                _ => {
+                    panic!("Cannot downgrade {:?} to {access:?}", self.category);
+                }
+            }
+        }
     }
 
     fn discard_modifications_for_gc_new_task(&mut self) {
@@ -1775,7 +1792,7 @@ impl TaskStorageAccessors for TaskGuardImpl<'_> {
     #[inline(always)]
     fn track_modification(
         &mut self,
-        category: crate::backend::storage::SpecificTaskDataCategory,
+        category: SpecificTaskDataCategory,
         name: &str,
     ) -> TrackOutcome {
         if self.task_id.is_transient() {
@@ -1793,7 +1810,7 @@ impl TaskStorageAccessors for TaskGuardImpl<'_> {
     }
 
     #[track_caller]
-    fn check_access(&self, category: crate::backend::storage::SpecificTaskDataCategory) {
+    fn check_access(&self, category: SpecificTaskDataCategory) {
         self.check_access(category);
     }
 }

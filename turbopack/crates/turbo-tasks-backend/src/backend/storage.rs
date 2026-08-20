@@ -36,6 +36,20 @@ pub enum TaskDataCategory {
     Data,
     All,
 }
+impl PartialOrd for TaskDataCategory {
+    /// `All` is greater than both `Meta` and `Data`; `Meta` and `Data` are unordered.
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering::*;
+
+        use TaskDataCategory::All;
+        match (self, other) {
+            _ if self == other => Some(Equal),
+            (All, _) => Some(Greater),
+            (_, All) => Some(Less),
+            _ => None,
+        }
+    }
+}
 
 /// Counts of tasks evicted at each level.
 #[derive(Debug, Default)]

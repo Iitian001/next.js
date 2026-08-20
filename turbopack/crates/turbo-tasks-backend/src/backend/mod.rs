@@ -214,8 +214,7 @@ pub struct TurboTasksBackend {
     /// `stop_and_wait`).
     snapshot_in_progress: Mutex<()>,
 
-    /// Whether the `parent_count` GC pass runs for this backend. Initialized from the
-    /// `TURBO_ENGINE_GC` env var; the constructor may force it off (see there).
+    /// Experimental feature to enable dead tasks to be deleted from storage and ram.
     gc_enabled: bool,
 
     stopping: AtomicBool,
@@ -253,11 +252,6 @@ impl TurboTasksBackend {
             .next_free_task_id()
             .expect("Failed to get task id");
 
-        // GC leaves collected tasks resident (soft-deleted) until a reclaim step removes them. The
-        // background `ReadWrite` loop reclaims them in `evict_after_snapshot`, so GC there REQUIRES
-        // eviction to be on; with eviction off, soft-deleted tasks would accumulate forever. The
-        // `ReadWriteOnShutdown` drain path drops the whole map wholesale, and `ReadOnly` never
-        // persists/GCs. Refuse that combination with a warning rather than leaking.
         let mut gc_enabled = std::env::var_os("TURBO_ENGINE_GC")
             .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
         if gc_enabled
@@ -380,8 +374,8 @@ impl TurboTasksBackend {
             .unwrap_or(0)
     }
 
-    /// Opens `task` with must-exist access and drops the guard. Test-only hook to exercise
-    /// the non-fabricating existence guarantee: this panics (debug builds) if `task` exists in
+    /// Opens `task` with the must-exist [`ExecuteContext::task`] and drops the guard. Test-only
+    /// hook to exercise the non-fabricating existence guarantee: this panics if `task` exists in
     /// neither memory nor persistent storage (rather than fabricating a blank).
     #[doc(hidden)]
     pub fn assert_task_exists_for_testing(
@@ -547,14 +541,7 @@ impl TurboTasksBackend {
         });
         let (mut task, mut reader_task) =
             lock_task_and_optional_reader(&mut ctx, task_id, need_reader_task);
-        // A GC-soft-deleted task must never be *read*: it was collected (edges scrubbed). Every
-        // re-entry funnels through `resurrect_deleted` at connect, which clears the flag and
-        // re-executes. Asserted here rather than in `task`/`MustExist` because bookkeeping opens
-        // legitimately touch a deleted task mid-resurrection.
-        debug_assert!(
-            !task.deleted(),
-            "read_task_output on a GC-deleted task {task_id} — a resurrection path was missed"
-        );
+        task.assert_not_deleted("read_task_output");
 
         fn listen_to_done_event(
             reader_description: Option<EventDescription>,
@@ -856,7 +843,7 @@ impl TurboTasksBackend {
         // done: true } it must have Output and would early return.
         let old = task.set_in_progress(in_progress_state);
         debug_assert!(old.is_none(), "InProgress already exists");
-        ctx.schedule_task(task, TaskPriority::Recomputation);
+        ctx.schedule_task(&task, TaskPriority::Recomputation);
 
         Ok(Err(listener))
     }
@@ -923,11 +910,7 @@ impl TurboTasksBackend {
         });
         let (mut task, reader_task) =
             lock_task_and_optional_reader(&mut ctx, task_id, need_reader_task);
-        // See the matching assert in `try_read_task_output`.
-        debug_assert!(
-            !task.deleted(),
-            "read_task_cell on a GC-deleted task {task_id} — a resurrection path was missed"
-        );
+        task.assert_not_deleted("read_task_cell");
 
         let content = if final_read_hint {
             task.remove_cell_data(&cell, &get_value_type(cell.type_id()).persistence)
@@ -1002,7 +985,7 @@ impl TurboTasksBackend {
             TaskExecutionReason::CellNotAvailable,
             EventDescription::new(|| task.get_task_desc_fn()),
         );
-        ctx.schedule_task(task, TaskPriority::Recomputation);
+        ctx.schedule_task(&task, TaskPriority::Recomputation);
 
         Ok(Err(listener))
     }
@@ -1984,6 +1967,9 @@ impl TurboTasksBackend {
         {
             let mut ctx = self.execute_context(turbo_tasks);
             let mut task = ctx.task(task_id, TaskDataCategory::All);
+            // Starting an execution for a collected task would rebuild it without going through
+            // the resurrection handshake that re-dirties it and restores its edges.
+            task.assert_not_deleted("try_start_task_execution");
             task_type = task.get_task_type().to_owned();
             let once_task = matches!(task_type, TaskType::Transient(ref tt) if matches!(&**tt, TransientTask::Once(_)));
             if let Some(tasks) = task.prefetch() {
@@ -2576,7 +2562,7 @@ impl TurboTasksBackend {
             )
             .entered();
             let mut make_stale = true;
-            let dependent = ctx.task(dependent_task_id, TaskDataCategory::All);
+            let mut dependent = ctx.task(dependent_task_id, TaskDataCategory::All);
             let transient_task_type = dependent.get_transient_task_type();
             if transient_task_type.is_some_and(|tt| matches!(&**tt, TransientTask::Once(_))) {
                 // once tasks are never invalidated
@@ -2600,8 +2586,7 @@ impl TurboTasksBackend {
                 return;
             }
             make_task_dirty_internal(
-                dependent,
-                dependent_task_id,
+                &mut dependent,
                 make_stale,
                 #[cfg(feature = "task_dirty_cause")]
                 cause.clone(),
@@ -3161,6 +3146,7 @@ impl TurboTasksBackend {
     ) -> Result<TypedCellContent> {
         let mut ctx = self.execute_context(turbo_tasks);
         let task = ctx.task(task_id, TaskDataCategory::Data);
+        task.assert_not_deleted("try_read_own_task_cell");
         if let Some(content) = task.get_cell_data(&cell).cloned() {
             Ok(CellContent(Some(content)).into_typed(cell.type_id()))
         } else {
@@ -3179,6 +3165,7 @@ impl TurboTasksBackend {
         let mut collectibles = AutoMap::default();
         {
             let mut task = ctx.task(task_id, TaskDataCategory::All);
+            task.assert_not_deleted("read_task_collectibles");
             if task
                 .get_persistent_task_type()
                 .is_some_and(|t| !t.native_fn.is_root)

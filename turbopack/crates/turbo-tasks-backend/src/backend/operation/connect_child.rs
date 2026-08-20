@@ -18,43 +18,39 @@ use crate::{
 
 /// Revive `task_id` if it was GC-soft-deleted, given a guard the caller already holds during the
 /// connect handshake.
-///
-/// GC is the only producer of the `deleted` flag and runs under an exclusion, so once cleared here
-/// it cannot be re-set concurrently.
 pub(super) fn resurrect_deleted<'e, C: ExecuteContext<'e>>(
     guard: C::TaskGuardImpl,
     task_id: TaskId,
-    category: TaskDataCategory,
     queue: &mut AggregationUpdateQueue,
     ctx: &mut C,
 ) -> C::TaskGuardImpl {
     if !guard.deleted() {
         return guard;
     }
+    let category = guard.access();
     drop(guard);
-    {
-        let mut task = ctx.task(task_id, TaskDataCategory::All);
-        // Double-check under the re-acquired guard: a concurrent connect may have revived it in the
-        // gap.
-        if task.deleted() {
-            // Clear + re-dirty atomically under this single guard so no observer sees `!deleted`
-            // before the task has been re-validated.
-            task.set_deleted(false);
-            if !task.immutable() {
-                make_task_dirty_internal(
-                    task,
-                    task_id,
-                    true,
-                    #[cfg(feature = "task_dirty_cause")]
-                    turbo_tasks::TaskDirtyCause::Resurrected,
-                    queue,
-                    ctx,
-                );
-            }
+
+    let mut task = ctx.task(task_id, TaskDataCategory::All);
+    // Double-check under the re-acquired guard: a concurrent connect may have revived it in the
+    // gap.
+    if task.deleted() {
+        // Clear + re-dirty atomically under this single guard so no observer sees `!deleted`
+        // before the task has been re-validated.
+        task.set_deleted(false);
+        if !task.immutable() {
+            make_task_dirty_internal(
+                &mut task,
+                true,
+                #[cfg(feature = "task_dirty_cause")]
+                turbo_tasks::TaskDirtyCause::Resurrected,
+                queue,
+                ctx,
+            );
         }
     }
-    // Hand back a guard of the caller's category so it can continue the handshake.
-    ctx.task(task_id, category)
+    // Conditionally downgrade from All->category so we don't hide incorrect access patterns.
+    task.downgrade_access(category);
+    task
 }
 
 #[derive(Encode, Decode, Clone, Default)]
@@ -127,13 +123,7 @@ impl ConnectChildOperation {
 
             // Revive the child if GC soft-deleted it. This can happen in a rare race between a
             // cache hit on a task and snapshotting actually performing the delete.
-            let mut child_task = resurrect_deleted(
-                child_task,
-                child_task_id,
-                TaskDataCategory::Meta,
-                &mut queue,
-                &mut ctx,
-            );
+            let mut child_task = resurrect_deleted(child_task, child_task_id, &mut queue, &mut ctx);
 
             let has_output = child_task.has_output();
             // An already constructed top-level task was made a root when it was first connected.
@@ -157,7 +147,7 @@ impl ConnectChildOperation {
                     EventDescription::new(|| child_task.get_task_desc_fn()),
                 )
             {
-                ctx.schedule_task(child_task, ctx.get_current_task_priority());
+                ctx.schedule_task(&child_task, ctx.get_current_task_priority());
             }
         }
 

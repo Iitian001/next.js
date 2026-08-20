@@ -858,21 +858,9 @@ impl TaskStorage {
         self.get_transient_ref_count().copied().unwrap_or(0)
     }
 
-    /// The storage-only part of GC collectibility. Does NOT include the transient-*id* check (a
-    /// `TaskStorage` has no id) — the caller must also confirm `!task_id.is_transient()`.
-    /// [`TaskGuard::is_gc_collectible`](crate::backend::operation::TaskGuard::is_gc_collectible)
-    /// is the authoritative predicate; it adds the id check and delegates here.
-    ///
-    /// **The `is_restored(Meta)` gate is load-bearing.** `parent_count` and the aggregation-edge
-    /// fields are Meta-category, so a task whose `Meta` has been evicted (`drop_partial`) reads
-    /// them as their defaults — `parent_count == 0`, empty `upper`/`followers` — and would look
-    /// collectible even though its *persisted* Meta says otherwise. This raw predicate has no
-    /// guard to restore Meta from disk, so it must refuse to judge an unrestored task and leave it
-    /// for a pass after it is next restored.
-    ///
-    /// The aggregation-edges check is conservative: a disconnected task is typically removed from
-    /// the aggregation graph, but that can lag and race GC, so we back off rather than collect.
+    /// Whether there are any live references to this task.
     pub fn gc_maybe_collectible(&self) -> bool {
+        // None of the predicates below are correct without this.
         self.flags.is_restored(TaskDataCategory::Meta)
             // Already collected this session (soft-deleted, awaiting tombstone + hard-delete):
             // don't re-select it, or a second pass would collect it again while it is still
@@ -882,6 +870,7 @@ impl TaskStorage {
             && self.gc_transient_ref_count() == 0
             && self.get_activeness().is_none()
             && self.get_in_progress().is_none()
+            // It is rare for upper/followers to be present when the ref counts are 0 but it can happen transiently during a concurrent GC pass as uppers are moved around during the cascade.
             && self.upper().is_empty()
             && self.followers().is_none_or(|f| f.is_empty())
     }
