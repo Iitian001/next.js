@@ -1042,14 +1042,13 @@ impl TurboTasksBackend {
             let gc_span = tracing::info_span!(
                 parent: parent_span.clone(),
                 "gc",
-                collected = tracing::field::Empty,
+                stats = tracing::field::Empty,
                 edges_deleted = tracing::field::Empty,
             )
             .entered();
             let gc_phase = self.snapshot_coord.begin_gc();
             let stats = self.gc_collect(turbo_tasks);
-            gc_span.record("collected", stats.collected);
-            gc_span.record("edges_deleted", stats.edges_deleted);
+            gc_span.record("stats", display(stats));
             gc_phase.into_snapshot()
         } else {
             self.snapshot_coord.begin_snapshot()

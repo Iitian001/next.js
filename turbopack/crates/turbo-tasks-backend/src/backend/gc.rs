@@ -9,7 +9,7 @@
 //! [`SnapshotCoordinator::begin_gc`](crate::backend::snapshot_coordinator)) — which excludes normal
 //! operations
 
-use std::{ops::ControlFlow, sync::atomic::Ordering};
+use std::{fmt::Display, ops::ControlFlow, sync::atomic::Ordering};
 
 use turbo_tasks::{TaskId, TurboTasks, scope_unbounded::scope_unbounded_with};
 
@@ -39,6 +39,17 @@ pub(crate) struct GcStats {
     pub collected: usize,
     /// Edges torn down across all collected tasks (children + forward-dependency reverse edges).
     pub edges_deleted: usize,
+}
+
+impl Display for GcStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "collected: {collected}, edges_deleted: {edges_deleted}",
+            collected = self.collected,
+            edges_deleted = self.edges_deleted
+        )
+    }
 }
 
 impl GcStats {
