@@ -471,10 +471,14 @@ impl<'a, O> GcPhase<'a, O> {
             (prev & GC_REQUESTED_BIT) != 0 && (prev & SNAPSHOT_REQUESTED_BIT) == 0,
             "into_snapshot: unexpected request bits {prev:#x}"
         );
-        debug_assert!(
-            (prev & !REQUEST_BITS) == 0,
-            "into_snapshot: operations in flight during hand-off {prev:#x}"
-        );
+        // NOTE: deliberately no assertion that the operation count is zero here. `begin_gc` drained
+        // it to zero, but `begin_operation` speculatively increments *before* it inspects the
+        // request bits and only backs the increment out once it has taken the state lock — which
+        // this thread is currently holding. So an operation that arrives during the hand-off can
+        // legitimately hold a +1 at this instant. It is guaranteed to observe a request bit (one is
+        // always set, by the RMW above) and park without ever running, which is the invariant that
+        // actually matters. `GcPhase::drop` and `SnapshotPhase::drop` likewise assert only on the
+        // request bits.
         let suspended_operations: Vec<Arc<O>> = state
             .suspended_operations
             .iter()
