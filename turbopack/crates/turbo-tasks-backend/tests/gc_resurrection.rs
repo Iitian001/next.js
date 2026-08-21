@@ -19,6 +19,8 @@
 
 mod util;
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use anyhow::Result;
 use turbo_tasks::{
     ResolvedVc, State, Vc, unmark_top_level_task_may_leak_eventually_consistent_state,
@@ -314,6 +316,232 @@ async fn gc_resurrect_on_reconnect() {
     })
     .await;
     result.unwrap();
+
+    tt.stop_and_wait().await;
+}
+
+// ============================================================================
+// Immutable tasks: GC drops their cells, so resurrection must re-execute
+// ============================================================================
+//
+// The fixtures above are deliberately *mutable* (they read a long-lived `State`) so that readers
+// record dependency edges. The ones below are the opposite case: `imm_leaf` has no invalidator, no
+// mutable dependencies and is not session-dependent, so it is marked `immutable` once it completes.
+//
+// That combination used to be invisible to GC: `resurrect_deleted` skipped
+// `make_task_dirty_internal` for immutable tasks, which was only sound because GC left their cells
+// in place. Now GC drops the cells, so a revived immutable task *must* come back dirty and
+// re-execute — and because these tasks are never snapshotted in these tests, there is nothing on
+// disk to restore from.
+
+/// Counts executions of `imm_leaf` so a test can prove the task really re-ran rather than served a
+/// retained cell. Value equality alone cannot distinguish the two: an immutable leaf returns the
+/// same number either way.
+static IMM_LEAF_EXECUTIONS: AtomicU32 = AtomicU32::new(0);
+
+/// An immutable leaf: no invalidator, no dependencies, not session dependent.
+#[turbo_tasks::function]
+fn imm_leaf(n: u32) -> Vc<u32> {
+    IMM_LEAF_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+    Vc::cell(n * 3)
+}
+
+/// Reads a fan-out of immutable leaves. Immutable itself, since all its dependencies are.
+#[turbo_tasks::function]
+async fn imm_reader() -> Result<Vc<u32>> {
+    let mut sum = 0u32;
+    for index in 0..IMM_FANOUT {
+        sum = sum.wrapping_add(*imm_leaf(index).await?);
+    }
+    Ok(Vc::cell(sum))
+}
+
+const IMM_FANOUT: u32 = 8;
+
+/// Selector-gated root: reads `imm_reader` only while the selector is `false`, so flipping to
+/// `true` disconnects the immutable subtree cleanly (no invalidation) and lets it reach
+/// `parent_count 0`.
+#[turbo_tasks::function(operation, root)]
+async fn select_imm_reader(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
+    let use_reader = !*selector.await?.get();
+    let value = if use_reader {
+        *imm_reader().await?
+    } else {
+        0u32
+    };
+    Ok(Vc::cell(value))
+}
+
+/// The headline case for dropping cell data in GC: an **immutable** task is collected (its cells
+/// released) and then reconnected before any snapshot. It must re-execute and produce the right
+/// value.
+///
+/// Before GC dropped cell data this worked by accident — the retained cells were still correct, so
+/// skipping the re-dirty was harmless. With the cells gone, skipping it would leave a clean task
+/// with no cells: reads would either fail outright or hand back nothing. The execution counter is
+/// what proves the task genuinely re-ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_resurrect_immutable_recomputes() {
+    let (tt, _persistence_dir) = create_tt("gc_resurrect_immutable_recomputes");
+    let tt2 = tt.clone();
+    let expected: u32 = (0..IMM_FANOUT).fold(0u32, |a, b| a.wrapping_add(b * 3));
+
+    let result = turbo_tasks::run_once(tt.clone(), async move {
+        unmark_top_level_task_may_leak_eventually_consistent_state();
+        let selector_op = create_selector(false);
+        let selector_vc = selector_op.resolve().strongly_consistent().await?;
+        let selector = selector_op.read_strongly_consistent().await?;
+
+        let output = select_imm_reader(selector_vc);
+        assert_eq!(*output.read_strongly_consistent().await?, expected);
+
+        // Disconnect the immutable subtree without invalidating it.
+        selector.set(true);
+        assert_eq!(*output.read_strongly_consistent().await?, 0);
+        anyhow::Ok(())
+    })
+    .await;
+    result.unwrap();
+
+    // Relative, not absolute: the counter is process-global and `imm_leaf` is shared with the other
+    // test in this file, which may have already run against a different backend instance.
+    let executions_before = IMM_LEAF_EXECUTIONS.load(Ordering::Relaxed);
+    assert!(
+        executions_before >= IMM_FANOUT,
+        "each immutable leaf should have executed at least once during the build, got \
+         {executions_before}"
+    );
+
+    // Collect the disconnected subtree: cells are dropped and `immutable` cleared, but the entries
+    // stay resident (no snapshot yet).
+    let collected = tt2.backend().gc_for_testing(&tt2);
+    assert_eq!(
+        collected,
+        IMM_FANOUT as usize + 1,
+        "imm_reader and all {IMM_FANOUT} immutable leaves should be collected"
+    );
+
+    // Reconnect BEFORE any snapshot. These tasks were never persisted, so there is nothing on disk
+    // to restore — the only way back to a correct value is re-execution.
+    let tt3 = tt.clone();
+    let result = turbo_tasks::run_once(tt.clone(), async move {
+        unmark_top_level_task_may_leak_eventually_consistent_state();
+        let selector_op = create_selector(false);
+        let selector_vc = selector_op.resolve().strongly_consistent().await?;
+        let selector = selector_op.read_strongly_consistent().await?;
+        selector.set(false);
+        let output = select_imm_reader(selector_vc);
+        assert_eq!(
+            *output.read_strongly_consistent().await?,
+            expected,
+            "a resurrected immutable task must recompute the correct value"
+        );
+        let _ = &tt3;
+        anyhow::Ok(())
+    })
+    .await;
+    result.unwrap();
+
+    assert!(
+        IMM_LEAF_EXECUTIONS.load(Ordering::Relaxed) > executions_before,
+        "the resurrected leaves must have re-executed (GC dropped their cells), but the execution \
+         count did not move past {executions_before}"
+    );
+
+    // A snapshot + evict must not have tombstoned the resurrected subtree, and the restored data
+    // must survive the round trip.
+    tt2.backend().snapshot_and_evict_for_testing(&tt2);
+    let tt4 = tt.clone();
+    let result = turbo_tasks::run_once(tt.clone(), async move {
+        unmark_top_level_task_may_leak_eventually_consistent_state();
+        let selector_op = create_selector(false);
+        let selector_vc = selector_op.resolve().strongly_consistent().await?;
+        let output = select_imm_reader(selector_vc);
+        assert_eq!(*output.read_strongly_consistent().await?, expected);
+        let _ = &tt4;
+        anyhow::Ok(())
+    })
+    .await;
+    result.unwrap();
+
+    tt.stop_and_wait().await;
+}
+
+/// Dedicated counter + fixtures for `gc_drops_cells_of_collected_immutable_task`. Kept separate
+/// from `imm_leaf` so the two tests, which run concurrently in one process and share the task
+/// cache, cannot satisfy each other's execution-count assertions.
+static IMM_LEAF2_EXECUTIONS: AtomicU32 = AtomicU32::new(0);
+
+#[turbo_tasks::function]
+fn imm_leaf2(n: u32) -> Vc<u32> {
+    IMM_LEAF2_EXECUTIONS.fetch_add(1, Ordering::Relaxed);
+    Vc::cell(n * 3)
+}
+
+#[turbo_tasks::function]
+async fn imm_reader2() -> Result<Vc<u32>> {
+    let mut sum = 0u32;
+    for index in 0..IMM_FANOUT {
+        sum = sum.wrapping_add(*imm_leaf2(index).await?);
+    }
+    Ok(Vc::cell(sum))
+}
+
+#[turbo_tasks::function(operation, root)]
+async fn select_imm_reader2(selector: ResolvedVc<Selector>) -> Result<Vc<u32>> {
+    let use_reader = !*selector.await?.get();
+    let value = if use_reader {
+        *imm_reader2().await?
+    } else {
+        0u32
+    };
+    Ok(Vc::cell(value))
+}
+
+/// GC must reclaim the cells it collects. Asserted through the public read path rather than by
+/// inspecting storage: after collection the cells are gone, so a subsequent read of the *same*
+/// immutable task has to re-execute it. A GC that left cells in place would serve them and the
+/// execution count would not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_drops_cells_of_collected_immutable_task() {
+    let (tt, _persistence_dir) = create_tt("gc_drops_cells_of_collected_immutable_task");
+    let tt2 = tt.clone();
+
+    let result = turbo_tasks::run_once(tt.clone(), async move {
+        unmark_top_level_task_may_leak_eventually_consistent_state();
+        let selector_op = create_selector(false);
+        let selector_vc = selector_op.resolve().strongly_consistent().await?;
+        let selector = selector_op.read_strongly_consistent().await?;
+        let output = select_imm_reader2(selector_vc);
+        output.read_strongly_consistent().await?;
+        selector.set(true);
+        output.read_strongly_consistent().await?;
+        anyhow::Ok(())
+    })
+    .await;
+    result.unwrap();
+
+    let before = IMM_LEAF2_EXECUTIONS.load(Ordering::Relaxed);
+    let collected = tt2.backend().gc_for_testing(&tt2);
+    assert_eq!(collected, IMM_FANOUT as usize + 1);
+
+    // Read one collected leaf directly (not through the selector root). Its cell was dropped, so
+    // this must recompute it rather than serve a stale value.
+    let tt3 = tt.clone();
+    let result = turbo_tasks::run_once(tt.clone(), async move {
+        unmark_top_level_task_may_leak_eventually_consistent_state();
+        assert_eq!(*imm_leaf2(0).await?, 0);
+        let _ = &tt3;
+        anyhow::Ok(())
+    })
+    .await;
+    result.unwrap();
+
+    assert!(
+        IMM_LEAF2_EXECUTIONS.load(Ordering::Relaxed) > before,
+        "reading a collected immutable leaf must re-execute it — if the count did not move, GC \
+         left its cell data in memory"
+    );
 
     tt.stop_and_wait().await;
 }

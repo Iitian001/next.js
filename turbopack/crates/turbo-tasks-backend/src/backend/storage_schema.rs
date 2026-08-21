@@ -1605,6 +1605,65 @@ mod tests {
         );
     }
 
+    /// `drop_partial(data=true, ..)` is the *eviction* contract, and is deliberately NOT how
+    /// `gc_collect` releases a collected task's data — it takes the cells directly
+    /// (`take_cell_data`) and clears `immutable` itself. Two reasons, both silent if they regress:
+    ///
+    /// 1. It clears `data_restored`, so the next acquisition restores from disk. For a soft-deleted
+    ///    task that next acquisition is `resurrect_deleted`'s `All` open, and `restore_data_from`
+    ///    assigns `persistent_task_type` unconditionally — so a never-persisted task would come
+    ///    back with no task type and panic in `get_task_type`.
+    /// 2. It clears every persisted data flag bit, a superset of the one flag GC wants cleared.
+    ///
+    /// The `persistent_task_type` half of (1) is covered end-to-end by
+    /// `tests/gc_collection.rs::gc_collects_disconnected_subtree`, which panics with "Every task
+    /// must have a task type" if GC ever takes the eviction path.
+    #[test]
+    fn drop_partial_data_is_the_eviction_contract_not_gcs() {
+        let mut storage = TaskStorage::new();
+        storage.flags.set_data_restored(true);
+        storage.flags.set_meta_restored(true);
+
+        let _ = storage.drop_partial(/* data */ true, /* meta */ false);
+
+        assert!(
+            !storage.flags.data_restored(),
+            "eviction expects the next access to restore from disk — which is exactly why GC must \
+             not use this path for a task it keeps resident: the restore would overwrite \
+             `persistent_task_type` with the absent on-disk copy"
+        );
+    }
+
+    /// GC's tombstone depends on the `*_modified` bits, which the snapshot scan uses twice: a shard
+    /// with a zero modified count is skipped entirely, and within a scanned shard only tasks with
+    /// `any_modified()` are visited. Those bits are `category = "transient"` and so sit outside
+    /// `DATA_MASK` — a data-category mutation cannot clear them.
+    ///
+    /// If a future flag reshuffle moved a `*_modified` bit inside `DATA_MASK`, GC would silently
+    /// stop tombstoning collected tasks and disk would retain what memory deleted, with no other
+    /// test failing. Hence this guard.
+    #[test]
+    fn clearing_persisted_data_bits_preserves_modified_bits_for_gc_tombstone() {
+        let mut storage = TaskStorage::new();
+        storage.flags.set_immutable(true);
+        // What GC does before dropping: mark meta modified so the snapshot scan visits the task.
+        storage.flags.set_meta_modified(true);
+
+        // The data-flag mutation GC performs (see `gc_collect`).
+        storage.flags.set_immutable(false);
+        storage.flags.clear_persisted_data_bits();
+
+        assert!(
+            storage.flags.meta_modified(),
+            "a data-category flag mutation must not clear the meta modified bit, or the snapshot \
+             would never emit the tombstone"
+        );
+        assert!(
+            storage.flags.any_modified(),
+            "the snapshot shard scan selects tasks by any_modified()"
+        );
+    }
+
     /// Filter-transient `output`: when `output` is `Some(transient)` it must
     /// survive `drop_partial(meta=true)` so restore can merge the disk value
     /// back in (normally disk value would be `None` if current output was

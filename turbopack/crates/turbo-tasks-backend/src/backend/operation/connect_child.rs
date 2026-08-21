@@ -18,6 +18,8 @@ use crate::{
 
 /// Revive `task_id` if it was GC-soft-deleted, given a guard the caller already holds during the
 /// connect handshake.
+///
+/// GC destructively mutates tasks so mark resurrected tasks as dirty to get them re-scheduled.
 pub(super) fn resurrect_deleted<'e, C: ExecuteContext<'e>>(
     guard: C::TaskGuardImpl,
     task_id: TaskId,
@@ -31,22 +33,23 @@ pub(super) fn resurrect_deleted<'e, C: ExecuteContext<'e>>(
     drop(guard);
 
     let mut task = ctx.task(task_id, TaskDataCategory::All);
-    // Double-check under the re-acquired guard: a concurrent connect may have revived it in the
-    // gap.
+    // Double-check under the re-acquired guard: a concurrent connect may have already done this
     if task.deleted() {
-        // Clear + re-dirty atomically under this single guard so no observer sees `!deleted`
-        // before the task has been re-validated.
         task.set_deleted(false);
-        if !task.immutable() {
-            make_task_dirty_internal(
-                &mut task,
-                true,
-                #[cfg(feature = "task_dirty_cause")]
-                turbo_tasks::TaskDirtyCause::Resurrected,
-                queue,
-                ctx,
-            );
-        }
+        // Mark dirty so it is rescheduled, GC has already dropped its edges and data, so we need to
+        // re-execute them to bring it back
+        // NOTE: recovering from disk is technically sometimes possible but doesn't work for new
+        // tasks, and the snapshot may have already persisted a tombstone.  So it would at
+        // best be an optimistic way to recover data that is in the process of being deleted. It
+        // shouldn't matter for resolving this rare race condition.
+        make_task_dirty_internal(
+            &mut task,
+            true,
+            #[cfg(feature = "task_dirty_cause")]
+            turbo_tasks::TaskDirtyCause::Resurrected,
+            queue,
+            ctx,
+        );
     }
     // Conditionally downgrade from All->category so we don't hide incorrect access patterns.
     task.downgrade_access(category);

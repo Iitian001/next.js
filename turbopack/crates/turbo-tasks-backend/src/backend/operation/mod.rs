@@ -27,6 +27,7 @@ pub use self::aggregation_update::ComputeDirtyAndCleanUpdate;
 use crate::{
     backend::{
         EventDescription, TaskDataCategory, TurboTasksBackend,
+        cell_data::CellData,
         snapshot_coordinator::OperationGuard,
         storage::{SpecificTaskDataCategory, StorageWriteGuard, TrackOutcome},
         storage_schema::{TaskStorage, TaskStorageAccessors},
@@ -1542,6 +1543,16 @@ pub trait TaskGuard: Debug + TaskStorageAccessors {
         self.typed_mut().cell_data_mut().insert(cell, value)
     }
 
+    // Removes all cell data
+    fn take_cell_data(&mut self) -> Option<CellData> {
+        self.check_access(SpecificTaskDataCategory::Data);
+        let undoable = self.track_modification(SpecificTaskDataCategory::Data, "cell_data");
+        let prev = self.typed_mut().take_cell_data();
+        if prev.is_none() {
+            self.undo_track_modification(undoable);
+        }
+        prev
+    }
     /// Remove cell data, returning the old value if present.
     fn remove_cell_data(
         &mut self,

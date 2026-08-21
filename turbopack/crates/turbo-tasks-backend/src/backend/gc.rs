@@ -4,6 +4,11 @@
 //! counts in `parent_count` and `transient_ref_count`.  Tasks are marked `deleted` and then have
 //! their outgoing edges teared down recursively.
 //!
+//! A collected task also has its cell data released immediately rather than waiting for the
+//! post-snapshot eviction sweep to erase the whole entry, so the bulk of the memory is reclaimed
+//! *before* the snapshot instead of after it. The entry itself stays resident until the tombstone
+//! commits, because a concurrent `CleanupOldEdges` scrub may still open it.
+//!
 //!  The pass runs under the
 //! coordinator's GC phase (see
 //! [`SnapshotCoordinator::begin_gc`](crate::backend::snapshot_coordinator)) — which excludes normal
@@ -100,6 +105,13 @@ impl TurboTasksBackend {
                     return ControlFlow::Continue(());
                 }
 
+                let old_edges = capture_all_outgoing_edges(&task);
+                // Clear `immutable` defensively so `resurrect_deleted` can mark the task dirty if
+                // it needs to
+                task.set_immutable(false);
+                // Drop the whole cell payload. This recovers most of the RAM while persistence
+                // writes the tombstone.
+                let _ = task.take_cell_data();
                 task.set_deleted(true);
                 if task.new_task() {
                     task.discard_modifications_for_gc_new_task();
@@ -109,7 +121,6 @@ impl TurboTasksBackend {
                 }
                 stats.collected += 1;
 
-                let old_edges = capture_all_outgoing_edges(&task);
                 drop(task);
 
                 stats.edges_deleted += old_edges.len();
