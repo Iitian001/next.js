@@ -1466,13 +1466,13 @@ impl AggregationUpdateQueue {
                     });
                 }
                 AggregationUpdateJob::AdjustTransientRefCount { task_ids, delta } => {
-                    ctx.for_each_task_meta(
-                        task_ids,
-                        "AdjustTransientRefCount",
-                        |mut task, _ctx| {
-                            task.update_and_get_transient_ref_count(delta);
-                        },
-                    );
+                    ctx.for_each_task_meta(task_ids, "AdjustTransientRefCount", |mut task, ctx| {
+                        if task.update_and_get_transient_ref_count(delta) == 0 {
+                            if task.is_gc_collectible() {
+                                ctx.note_gc_collectible(task.id());
+                            }
+                        }
+                    });
                 }
                 AggregationUpdateJob::DecreaseActiveCount { task } => {
                     self.decrease_active_count(ctx, task);
@@ -2019,7 +2019,7 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
-                    // If followers became empty the task might be collectible, check now.
+                    // If we dropped the last follower we might be collectible
                     if upper.is_followers_empty() && upper.is_gc_collectible() {
                         ctx.note_gc_collectible(upper_id);
                     }
@@ -2121,6 +2121,7 @@ impl AggregationUpdateQueue {
             if !removed_uppers.is_empty() {
                 let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                 let followers = get_followers(&follower);
+                // If we dropped the last upper we might be collectible
                 if follower.is_upper_empty() && follower.is_gc_collectible() {
                     ctx.note_gc_collectible(lost_follower_id);
                 }
@@ -2204,6 +2205,7 @@ impl AggregationUpdateQueue {
                     let has_active_count = ctx.should_track_activeness()
                         && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                     let upper_ids = get_uppers(&upper);
+                    // If we dropped the last folower we might be collectible
                     if upper.is_followers_empty() && upper.is_gc_collectible() {
                         ctx.note_gc_collectible(upper_id);
                     }
@@ -2315,8 +2317,7 @@ impl AggregationUpdateQueue {
                 if remove_upper {
                     let data = AggregatedDataUpdate::from_task(&mut follower).invert();
                     let followers = get_followers(&follower);
-                    // Losing the last upper edge can satisfy the aggregation-emptiness clauses of
-                    // the GC predicate, so re-check it here under the guard we already hold.
+                    // If we dropped the last upper we might be collectible
                     if follower.is_upper_empty() && follower.is_gc_collectible() {
                         ctx.note_gc_collectible(lost_follower_id);
                     }
@@ -2401,6 +2402,7 @@ impl AggregationUpdateQueue {
                 let has_active_count = ctx.should_track_activeness()
                     && upper.get_activeness().is_some_and(|a| a.active_counter > 0);
                 let upper_ids = get_uppers(&upper);
+                // If we dropped the last follower we might be collectible
                 if upper.is_followers_empty() && upper.is_gc_collectible() {
                     ctx.note_gc_collectible(upper_id);
                 }
@@ -3204,8 +3206,7 @@ impl AggregationUpdateQueue {
             // persistent_task_type is now set eagerly in initialize_new_task.
             AGGREGATION_UPDATE_CATEGORY,
         );
-        // Revive the task if GC soft-deleted it.  This would be a rare race between GC and
-        // execution.
+        // Revive the task if GC soft-deleted it.
         let mut task = resurrect_deleted(task, task_id, self, ctx);
         self.check_optimization_pending(&task);
         let state = task.get_activeness_mut_or_insert_with(|| ActivenessState::new(task_id));
