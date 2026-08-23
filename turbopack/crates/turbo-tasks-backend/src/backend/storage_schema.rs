@@ -880,6 +880,13 @@ impl TaskStorage {
             && self.followers().is_none_or(|f| f.is_empty())
     }
 
+    /// Whether the garbage collector has soft-deleted this task (see the `deleted` flag). Used
+    /// after a GC pass drains to tell which of the pass's GC roots were collected, without the
+    /// collect path having to record every id it deletes.
+    pub fn is_gc_deleted(&self) -> bool {
+        self.flags.deleted()
+    }
+
     /// Whether this task is a durable GC **root**: parent-less, but anchored by a live external
     /// reference (`transient_ref_count > 0`) rather than by the tracked graph.
     ///

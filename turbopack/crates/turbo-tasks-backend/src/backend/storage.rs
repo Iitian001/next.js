@@ -585,17 +585,25 @@ impl Storage {
     ///   as a collect job and re-validates it authoritatively under a guard.
     /// - **roots** — durable roots ([`TaskStorage::gc_is_root`]): `parent_count == 0` **and**
     ///   anchored from outside the graph (`transient_ref_count > 0`), such as the pinned
-    ///   `ProjectContainer` op or a live endpoint — are returned. GC uses them to maintain the
-    ///   persisted roots map (mark still-anchored roots live / age out orphans).
+    ///   `ProjectContainer` op or a live endpoint — are passed to `on_root`. GC uses them to
+    ///   maintain the persisted roots map (mark still-anchored roots live / age out orphans).
     ///
     /// The two sets are **disjoint**: a `parent_count == 0` task either has an anchor (a root) or
     /// does not (a collectible candidate — ordinary garbage). GC never treats one as both.
     ///
+    /// Both callbacks run while this shard's read lock is held, so they must be cheap and must not
+    /// re-enter the map. GC's push each id onto per-worker state (a job queue and a thread-local
+    /// accumulator respectively), so neither takes a lock of its own.
+    ///
     /// Sees only resident tasks; disk-only roots ride the carried-forward roots map instead (which
     /// is where a root whose anchor later drops is aged out).
-    pub fn gc_scan_shard(&self, index: usize, mut on_candidate: impl FnMut(TaskId)) -> Vec<TaskId> {
+    pub fn gc_scan_shard(
+        &self,
+        index: usize,
+        mut on_candidate: impl FnMut(TaskId),
+        mut on_root: impl FnMut(TaskId),
+    ) {
         let shard = self.map.shards()[index].read();
-        let mut roots = Vec::new();
         // SAFETY: we hold the shard read lock for the duration of iteration.
         for bucket in unsafe { shard.iter() } {
             // SAFETY: the read lock guard outlives the bucket reference.
@@ -608,10 +616,9 @@ impl Storage {
                 on_candidate(*task_id);
             }
             if storage.gc_is_root() {
-                roots.push(*task_id);
+                on_root(*task_id);
             }
         }
-        roots
     }
 
     pub fn access_pair_mut(

@@ -26,7 +26,6 @@ use std::{
 };
 
 use bincode::{Decode, Encode};
-use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use turbo_tasks::{TaskId, TurboTasks, scope_unbounded::scope_unbounded_with};
 
@@ -87,15 +86,21 @@ enum GcJob {
     Collect(TaskId),
 }
 
-/// Observability counters for one [`TurboTasksBackend::gc_collect`] pass.
+/// Per-drainer accumulator for one [`TurboTasksBackend::gc_collect`] pass: observability counters
+/// plus the root ids the pass discovers.
 ///
-/// `collected`/`edges_deleted` are accumulated per drainer and folded at the join (see
-/// [`GcStats::merge`]) rather than through shared atomics: at one increment per collected task
-/// across every worker, shared counters were several percent of collect time in profiles.
+/// Everything here is accumulated **per drainer** and folded at the join (see [`GcStats::merge`])
+/// rather than through shared atomics or mutexes. At one update per collected task across every
+/// worker, shared counters were several percent of collect time in profiles, and the
+/// discovered-root vectors have the same shape — so they ride along in the same thread-local
+/// accumulator instead of behind their own locks.
+///
+/// `gc_roots`/`aged_out_roots` are the exceptions: they are assigned once after the pool drains and
+/// `merge` deliberately leaves them alone.
 #[derive(Default)]
 pub(crate) struct GcStats {
-    /// Size of the reconciled GC roots map at the end of the pass. Unlike the other two counters
-    /// this is not accumulated per drainer — it is assigned once from the final map, after the
+    /// Size of the reconciled GC roots map at the end of the pass. Unlike the counters below this
+    /// is not accumulated per drainer — it is assigned once from the final map, after the
     /// scan-discovered and cascade-discovered roots are folded in and the collected ones removed.
     pub gc_roots: usize,
     /// Tasks collected (marked soft-deleted).
@@ -110,6 +115,13 @@ pub(crate) struct GcStats {
     /// Like `gc_roots`, assigned once after the pool drains (from the seed set) rather than
     /// accumulated per drainer, so [`GcStats::merge`] leaves it alone.
     pub aged_out_roots: usize,
+    /// Durable roots reported by this drainer's [`GcJob::ScanShard`] jobs, folded into the roots
+    /// map after the pool drains.
+    scanned_roots: Vec<TaskId>,
+    /// Newly-orphaned tasks discovered as the cascade decrements children to `parent_count == 0`
+    /// but that are NOT collected this pass (e.g. still anchored by a pin) — they are new durable
+    /// roots and must enter the map with a fresh timestamp, or they'd never be tracked/aged.
+    discovered_roots: Vec<TaskId>,
 }
 
 impl Display for GcStats {
@@ -127,12 +139,24 @@ impl Display for GcStats {
 }
 
 impl GcStats {
-    /// Combines two drainers' counts. Addition, so associative and commutative as
+    /// Combines two drainers' accumulators. Addition and concatenation, so associative and (up to
+    /// the order of the root vectors, which are only ever folded into a map) commutative as
     /// [`scope_unbounded_with`] requires.
-    fn merge(mut self, other: Self) -> Self {
+    ///
+    /// Appends into whichever side is already longer so the fold does not repeatedly copy a large
+    /// accumulator into a small one.
+    fn merge(mut self, mut other: Self) -> Self {
         self.collected += other.collected;
         self.edges_deleted += other.edges_deleted;
         self.gc_roots += other.gc_roots;
+        if self.scanned_roots.len() < other.scanned_roots.len() {
+            std::mem::swap(&mut self.scanned_roots, &mut other.scanned_roots);
+        }
+        self.scanned_roots.append(&mut other.scanned_roots);
+        if self.discovered_roots.len() < other.discovered_roots.len() {
+            std::mem::swap(&mut self.discovered_roots, &mut other.discovered_roots);
+        }
+        self.discovered_roots.append(&mut other.discovered_roots);
         self
     }
 }
@@ -283,30 +307,10 @@ impl TurboTasksBackend {
             });
         }
 
-        // Newly-orphaned tasks discovered as the cascade decrements children to `parent_count == 0`
-        // but that are NOT collected this pass (e.g. still anchored by a pin) — they are new
-        // durable roots and must enter the map with a fresh timestamp, or they'd never be
-        // tracked/aged.
-        let discovered_roots = Mutex::new(Vec::<TaskId>::new());
-
-        // Tasks this pass actually marked deleted. `gc_roots_refresh_and_age_out` deliberately
-        // leaves every entry in `roots` (it only *seeds* aged-out roots), so this is what tells us
-        // which entries may now be dropped from the persisted map. Recorded at the `set_deleted`
-        // site below, i.e. only for tasks that really were collected — a seed that was re-validated
-        // non-collectible, or never reached, stays in the map and ages again next pass.
-        //
-        // Only collected *roots* can matter here (a non-root collect was never in the map), but
-        // recording every collect and intersecting at the end is cheaper than checking map
-        // membership under the pass's shared lock on the hot path.
-        let collected_ids = Mutex::new(Vec::<TaskId>::new());
-
-        // Roots discovered by the shard scans, folded into the map after the pool drains.
-        let scanned_roots = Mutex::new(Vec::<TaskId>::new());
-
         // Each job builds its own GC `ExecuteContext`; see the doc above for the concurrency
-        // argument. Counts accumulate into a per-drainer `GcStats` and are folded at the join, so
-        // the hot path touches no shared state. The aged-out seeds ride in as `Collect` jobs
-        // alongside the per-shard scans.
+        // argument. Counts *and* the discovered-root id lists accumulate into a per-drainer
+        // `GcStats` and are folded at the join, so the hot path touches no shared state at all. The
+        // aged-out seeds ride in as `Collect` jobs alongside the per-shard scans.
         let seeds = seeds
             .into_iter()
             .chain(aged_out_seeds.iter().copied().map(GcJob::Collect));
@@ -316,12 +320,11 @@ impl TurboTasksBackend {
             |spawner, job, stats| {
                 let task_id = match job {
                     GcJob::ScanShard(index) => {
-                        let roots = self
-                            .storage
-                            .gc_scan_shard(index, |task_id| spawner.spawn(GcJob::Collect(task_id)));
-                        if !roots.is_empty() {
-                            scanned_roots.lock().extend(roots);
-                        }
+                        self.storage.gc_scan_shard(
+                            index,
+                            |task_id| spawner.spawn(GcJob::Collect(task_id)),
+                            |root_id| stats.scanned_roots.push(root_id),
+                        );
                         return ControlFlow::Continue(());
                     }
                     GcJob::Collect(task_id) => task_id,
@@ -371,10 +374,6 @@ impl TurboTasksBackend {
                     let _ = task.track_modification(SpecificTaskDataCategory::Meta, "gc_deleted");
                 }
                 stats.collected += 1;
-                // Record the collect so the roots map can drop this entry (if it had one) after the
-                // pass. Touched once per collected task, not per child/dep, so the lock is not a
-                // contention hot spot — same argument as `discovered_roots`.
-                collected_ids.lock().push(task_id);
                 // A span (not a free-standing event) so the collect shows up as a node in the trace
                 // tree under the `gc` span — the trace server / `next internal trace` MCP surface
                 // spans, and free events attached to no span are not queryable there.
@@ -411,7 +410,7 @@ impl TurboTasksBackend {
                         // the roots map with a fresh timestamp and starts aging instead of being
                         // collected. (The shard scan may not have caught this newly-orphaned child:
                         // its shard may already have been scanned before this cascade ran.)
-                        GcCandidate::Root(id) => discovered_roots.lock().push(id),
+                        GcCandidate::Root(id) => stats.discovered_roots.push(id),
                     }
                 }
 
@@ -435,27 +434,43 @@ impl TurboTasksBackend {
         // "this root was observed live" directly instead of silently depending on that coincidence,
         // so it stays correct if the retain is ever narrowed or the scan learns to report roots the
         // retain skipped.
-        for id in scanned_roots.into_inner() {
+        for id in stats.scanned_roots.drain(..) {
             roots.insert(id, TtlCounter::MostRecent);
         }
-        for id in discovered_roots.into_inner() {
+        for id in stats.discovered_roots.drain(..) {
             roots.insert(id, TtlCounter::MostRecent);
         }
 
         // Now drop the entries for tasks this pass actually collected.
-        // `gc_roots_refresh_and_age_out` kept every entry (it only seeds aged-out roots),
-        // so this is the *only* place a root leaves the map — which is what keeps the
-        // persisted set from losing a root that was seeded but not collected. A collected
-        // task is gone from the graph, so its entry would otherwise be a permanent stale
-        // key in the roots set.
+        // `gc_roots_refresh_and_age_out` deliberately kept every entry it merely *seeded*,
+        // which is what keeps the persisted set from losing a root that was seeded but
+        // turned out non-collectible; a collect is the only thing that removes one. A
+        // collected task is gone from the graph, so its entry would otherwise be a
+        // permanent stale key in the roots set.
+        //
+        // Read each root's `deleted` bit straight out of the storage map, rather than having the
+        // collect path record every id it deletes. Only collected *roots* can matter here (a
+        // non-root collect was never in the map), so this walks the roots map — a few hundred
+        // entries in a typical session — instead of allocating, merging, and re-scanning one id per
+        // collected task, which is unbounded in the size of the collected subtree. It is the same
+        // read `gc_roots_refresh_and_age_out` does for entries collected by an *earlier* pass; this
+        // is the after-the-pool half, covering the ones this pass just collected.
+        //
+        // `with_task` takes a shard *read* lock and reads one transient flag; the pool has drained,
+        // so nothing contends with it. A root that is not resident (a disk-only cross-session root
+        // this pass never restored) reads as `None` and is correctly kept — GC only ever
+        // soft-deletes a task it has made resident, so a non-resident root was not collected.
         //
         // Runs after the fold-ins so the two can't fight over an id. They are in fact disjoint (a
         // cascade child is recorded as *either* spawned-and-collected *or* a discovered root, and a
         // collected task fails `gc_is_root` so the scan won't report it), but ordering it this way
         // means a collect always wins, which is the safe direction: the task no longer exists.
-        for id in collected_ids.into_inner() {
-            roots.remove(&id);
-        }
+        roots.retain(|&id, _| {
+            !self
+                .storage
+                .with_task(id, |storage| storage.is_gc_deleted())
+                .unwrap_or(false)
+        });
 
         stats.gc_roots = roots.len();
         stats.aged_out_roots = aged_out_seeds.len();
