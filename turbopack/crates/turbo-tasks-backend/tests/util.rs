@@ -23,6 +23,22 @@ use turbo_tasks_backend::{
 /// Reusing the same `path` (after the previous backend has been stopped) reopens the persisted
 /// database, which is how a test can assert that state survives a restart.
 fn open_tt_at(path: &Path, num_workers: usize) -> Arc<TurboTasks<TurboTasksBackend>> {
+    open_tt_at_with_gc(path, num_workers, None)
+}
+
+/// Like [`open_tt_at`], but forces the GC on or off for this backend instead of deriving it from
+/// the `TURBO_ENGINE_GC` env var.
+///
+/// A test that depends on the **persisted GC roots map** must force it on: the map is only written
+/// by the GC branch of `snapshot_and_persist`, so with GC off a session persists an empty root set
+/// and any cross-session root behaviour the test means to exercise silently never engages. Forcing
+/// it here rather than via the env var keeps it scoped to this backend, since every test in a
+/// binary shares the process environment.
+fn open_tt_at_with_gc(
+    path: &Path,
+    num_workers: usize,
+    gc: Option<bool>,
+) -> Arc<TurboTasks<TurboTasksBackend>> {
     TurboTasks::new(TurboTasksBackend::new(
         BackendOptions {
             num_workers: Some(num_workers),
@@ -31,6 +47,7 @@ fn open_tt_at(path: &Path, num_workers: usize) -> Arc<TurboTasks<TurboTasksBacke
             // snapshot_and_evict_for_testing manually.
             storage_mode: Some(turbo_tasks_backend::StorageMode::ReadWriteOnShutdown),
             eviction_mode: EvictionMode::Full,
+            gc,
             ..Default::default()
         },
         turbo_tasks_backend::turbo_backing_storage(
@@ -64,6 +81,12 @@ pub fn create_persistence_dir(name: &str) -> tempfile::TempDir {
 /// flushed.
 pub fn reopen_tt(dir: &tempfile::TempDir) -> Arc<TurboTasks<TurboTasksBackend>> {
     open_tt_at(dir.path(), 2)
+}
+
+/// [`reopen_tt`] with the GC forced on, for tests that assert on cross-session root behaviour.
+/// See [`open_tt_at_with_gc`] for why the env var is not enough.
+pub fn reopen_tt_with_gc(dir: &tempfile::TempDir) -> Arc<TurboTasks<TurboTasksBackend>> {
+    open_tt_at_with_gc(dir.path(), 2, Some(true))
 }
 
 /// A fresh persistent backend in its own temp directory, with `num_workers` workers.

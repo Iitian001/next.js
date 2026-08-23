@@ -22,7 +22,7 @@ use turbo_tasks::{
     GcRoot, ResolvedVc, State, Vc, unmark_top_level_task_may_leak_eventually_consistent_state,
 };
 
-use crate::util::{create_persistence_dir, reopen_tt};
+use crate::util::{create_persistence_dir, reopen_tt_with_gc};
 
 /// Counts executions of [`orphan_leaf`], keyed by its argument. A collected task has to re-execute
 /// when it is next requested, so a bump here is the observable signal that it was reclaimed —
@@ -124,7 +124,7 @@ async fn reused_root_survives_sessions_that_abandon_its_sibling() {
     // live handle to a route. The pin is what makes the task a *durable root* (`transient_ref_count
     // > 0`) and gets it recorded in the persisted roots map on shutdown.
     let kept_root = {
-        let tt = reopen_tt(&dir);
+        let tt = reopen_tt_with_gc(&dir);
         let ids = turbo_tasks::run_once(tt.clone(), async move {
             unmark_top_level_task_may_leak_eventually_consistent_state();
             let kept = root_with_child(1);
@@ -153,7 +153,7 @@ async fn reused_root_survives_sessions_that_abandon_its_sibling() {
     // is a second restart, proving the collection stuck and left the surviving root unharmed.
     let mut total_collected = 0usize;
     for session in 2..=3 {
-        let tt = reopen_tt(&dir);
+        let tt = reopen_tt_with_gc(&dir);
         tt.backend().set_gc_root_ttl_for_testing(0);
         let tt2 = tt.clone();
         turbo_tasks::run_once(tt.clone(), async move {
@@ -194,7 +194,7 @@ async fn reused_root_survives_sessions_that_abandon_its_sibling() {
 
     // Session 4: the surviving root must still be cached, and the collected one must rebuild.
     {
-        let tt = reopen_tt(&dir);
+        let tt = reopen_tt_with_gc(&dir);
         let kept_before = leaf_executions(1);
         let dropped_before = leaf_executions(2);
         let result = turbo_tasks::run_once(tt.clone(), async move {
@@ -249,7 +249,7 @@ async fn gc_collect_scrubs_disk_only_forward_dep_target() {
     // un-anchored and age it out. Without this the root is never a tracked root at all, so nothing
     // is ever collected and the cascade under test never runs.
     {
-        let tt = reopen_tt(&dir);
+        let tt = reopen_tt_with_gc(&dir);
         let root_id = turbo_tasks::run_once(tt.clone(), async move {
             unmark_top_level_task_may_leak_eventually_consistent_state();
             let constant_op = create_constant();
@@ -277,7 +277,7 @@ async fn gc_collect_scrubs_disk_only_forward_dep_target() {
     // collecting it cascades to every A/B pair. B targets are disk-only until the cascade restores
     // them — an A that scrubs its target before that must restore it, not panic.
     {
-        let tt = reopen_tt(&dir);
+        let tt = reopen_tt_with_gc(&dir);
         tt.backend().set_gc_root_ttl_for_testing(0);
         let tt2 = tt.clone();
         turbo_tasks::run_once(tt.clone(), async move {
@@ -326,7 +326,7 @@ async fn gc_collect_scrubs_disk_only_forward_dep_target() {
 
     // Session 3: a clean recompute must still work — no dangling reverse edge left on any target.
     {
-        let tt = reopen_tt(&dir);
+        let tt = reopen_tt_with_gc(&dir);
         let result = turbo_tasks::run_once(tt.clone(), async move {
             unmark_top_level_task_may_leak_eventually_consistent_state();
             let constant_op = create_constant();

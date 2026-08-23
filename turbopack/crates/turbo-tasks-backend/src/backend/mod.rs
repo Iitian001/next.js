@@ -286,15 +286,20 @@ impl TurboTasksBackend {
             .next_free_task_id()
             .expect("Failed to get task id");
 
-        let mut gc_enabled = std::env::var_os("TURBO_ENGINE_GC")
-            .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")));
+        // An explicit `options.gc` wins over the env var, so a test can run GC (and persist the
+        // roots map) deterministically without mutating a process-global that every other test in
+        // the binary shares.
+        let mut gc_enabled = options.gc.unwrap_or_else(|| {
+            std::env::var_os("TURBO_ENGINE_GC")
+                .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")))
+        });
         if gc_enabled
             && matches!(options.storage_mode, Some(StorageMode::ReadWrite))
             && options.eviction_mode == EvictionMode::Off
         {
             eprintln!(
-                "warning: TURBO_ENGINE_GC is set but eviction is disabled on a ReadWrite backend; \
-                 GC would leave collected tasks resident forever. Forcing GC off. Enable eviction \
+                "warning: GC is enabled but eviction is disabled on a ReadWrite backend; GC would \
+                 leave collected tasks resident forever. Forcing GC off. Enable eviction \
                  ('auto'/'full') to use GC in this mode."
             );
             gc_enabled = false;
