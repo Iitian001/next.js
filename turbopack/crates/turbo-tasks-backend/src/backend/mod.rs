@@ -79,6 +79,7 @@ use crate::{
         ActivenessState, CellRef, CollectibleRef, CollectiblesRef, Dirtyness, InProgressCellState,
         InProgressState, InProgressStateInner, OutputValue, TransientTask,
     },
+    database::db_versioning::gc_enabled_from_env,
     error::TaskError,
     kv_backing_storage::TurboBackingStorage,
     utils::{
@@ -160,6 +161,12 @@ pub struct BackendOptions {
     /// it from the `TURBO_ENGINE_GC` env var; `Some` forces it on/off (used by tests to run GC
     /// — and persist the roots map — deterministically without racing the process-global env).
     /// The debug eviction-safety check in the constructor still applies.
+    ///
+    /// **Tests only, and only with a throwaway database.** The env var also selects the database
+    /// *directory* (`-gc` suffix, see `db_versioning::GC_VERSION_SUFFIX`), and this override does
+    /// not: it deliberately decouples the two, so forcing GC on against a directory chosen for a
+    /// non-GC run is exactly the mismatch the suffix exists to prevent. Safe in tests because each
+    /// supplies its own fresh temp dir; never set this on a real cache path.
     pub gc: Option<bool>,
 }
 
@@ -289,10 +296,13 @@ impl TurboTasksBackend {
         // An explicit `options.gc` wins over the env var, so a test can run GC (and persist the
         // roots map) deterministically without mutating a process-global that every other test in
         // the binary shares.
-        let mut gc_enabled = options.gc.unwrap_or_else(|| {
-            std::env::var_os("TURBO_ENGINE_GC")
-                .is_some_and(|v| matches!(v.to_str(), Some("1" | "true" | "yes")))
-        });
+        //
+        // The env-var path goes through `gc_enabled_from_env` — the same function that decides
+        // whether the database directory gets the `-gc` suffix. The two must agree: running GC
+        // against a database written without it would collect live top-level tasks, since they were
+        // never recorded in the `GcRoots` key. `options.gc` bypasses that pairing on purpose, and
+        // is only for tests, which supply their own throwaway directory.
+        let mut gc_enabled = options.gc.unwrap_or_else(gc_enabled_from_env);
         if gc_enabled
             && matches!(options.storage_mode, Some(StorageMode::ReadWrite))
             && options.eviction_mode == EvictionMode::Off
