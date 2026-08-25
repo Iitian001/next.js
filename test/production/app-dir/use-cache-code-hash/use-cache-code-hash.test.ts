@@ -60,10 +60,6 @@ async function getCodeHashes(
         ).toMatchInlineSnapshot(`
          [
            "BUNDLED_NON_INLINED_ENVVAR",
-           "NEXT_PRIVATE_DEBUG_CACHE",
-           "NEXT_OTEL_VERBOSE",
-           "NEXT_OTEL_PERFORMANCE_PREFIX",
-           "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY",
            "EXTERNAL_ENV_VAR",
          ]
         `)
@@ -75,10 +71,6 @@ async function getCodeHashes(
         ).toMatchInlineSnapshot(`
          [
            "DECOY",
-           "NEXT_PRIVATE_DEBUG_CACHE",
-           "NEXT_OTEL_VERBOSE",
-           "NEXT_OTEL_PERFORMANCE_PREFIX",
-           "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY",
          ]
         `)
       })
