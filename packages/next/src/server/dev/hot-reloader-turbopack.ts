@@ -101,6 +101,11 @@ import { isMetadataRouteFile } from '../../lib/metadata/is-metadata-route'
 import { setBundlerFindSourceMapImplementation } from '../patch-error-inspect'
 import { setBundlerFindSourceMapURLImplementation } from '../lib/source-maps'
 import {
+  getWebSocketRouteBundlePath,
+  invalidateWebSocketRoutes,
+  reloadWebSocketScope,
+} from '../websocket-connection-registry'
+import {
   formatIssue,
   isFileSystemCacheEnabledForDev,
   isWellKnownError,
@@ -269,6 +274,31 @@ function collectUpdatedChunkPaths(
     )
   }
   return Array.from(paths)
+}
+
+/** Maps a Turbopack entry chunk under `server/app` to its route bundle key. */
+export function getWebSocketRouteBundlePathFromTurbopackEntry(
+  entryPath: string
+): string | undefined {
+  const normalizedPath = entryPath.replaceAll('\\', '/')
+  if (
+    normalizedPath.startsWith('/') ||
+    /^[A-Za-z]:\//.test(normalizedPath) ||
+    !normalizedPath.endsWith('.js')
+  ) {
+    return undefined
+  }
+
+  const page = normalizedPath.slice(0, -'.js'.length)
+  if (
+    page.length === 0 ||
+    page
+      .split('/')
+      .some((segment) => segment === '' || segment === '.' || segment === '..')
+  ) {
+    return undefined
+  }
+  return getWebSocketRouteBundlePath(page)
 }
 
 interface ServerHmrSubscriptionLoopOptions {
@@ -1934,6 +1964,12 @@ export async function createHotReloaderTurbopack(
     },
     async invalidate({ reloadAfterInvalidation }) {
       if (reloadAfterInvalidation) {
+        if (
+          nextConfig.experimental.webSocketRouteHandlers &&
+          opts.webSocketRegistryScope
+        ) {
+          void reloadWebSocketScope(opts.webSocketRegistryScope)
+        }
         for (const [key, entrypoint] of currentWrittenEntrypoints) {
           clearRequireCache(key, entrypoint, { force: true })
         }
@@ -2270,23 +2306,60 @@ export async function createHotReloaderTurbopack(
     process.exit(1)
   })
 
-  // Tell browsers to refetch RSC (soft refresh, not full page reload).
-  // Skip while there are outstanding compilation errors: an RSC refetch would
-  // 500 and force a full-page navigation, losing client state (e.g. recovering
-  // from a syntax error). A subsequent successful compile/apply fires this
-  // again to refresh.
-  function notifyServerComponentChanges() {
-    if (hasCompilationErrors()) return
-    hotReloader.send({
-      type: HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES,
-    })
-  }
-
   if (serverFastRefresh) {
+    const webSocketRegistryScope = opts.webSocketRegistryScope
+    const invalidateChangedWebSocketRoutes = ({
+      chunkPaths,
+      affectedEntries,
+      hasAffectedEntriesMetadata,
+    }: {
+      chunkPaths: string[]
+      affectedEntries: string[] | undefined
+      hasAffectedEntriesMetadata: boolean
+    }) => {
+      if (
+        !nextConfig.experimental.webSocketRouteHandlers ||
+        !webSocketRegistryScope
+      ) {
+        return
+      }
+
+      let affected: ReadonlySet<string> | 'unknown' = 'unknown'
+      if (
+        hasAffectedEntriesMetadata &&
+        Array.isArray(affectedEntries) &&
+        !(chunkPaths.length > 0 && affectedEntries.length === 0)
+      ) {
+        const bundlePaths = new Set<string>()
+        let unmapped = false
+        for (const entryPath of affectedEntries) {
+          const bundlePath =
+            typeof entryPath === 'string'
+              ? getWebSocketRouteBundlePathFromTurbopackEntry(entryPath)
+              : undefined
+          if (!bundlePath) {
+            // An unmapped entry shape means the affected set cannot be proven.
+            unmapped = true
+            break
+          }
+          bundlePaths.add(bundlePath)
+        }
+        affected = unmapped ? 'unknown' : bundlePaths
+      }
+      invalidateWebSocketRoutes(webSocketRegistryScope, affected)
+    }
+
     serverHmrTask = setupServerHmr(project, {
       runtimeRoot,
       signal: backgroundSubscriptionController.signal,
       reEvaluateAllModulesExpensive: async () => {
+        if (
+          nextConfig.experimental.webSocketRouteHandlers &&
+          webSocketRegistryScope
+        ) {
+          void reloadWebSocketScope(webSocketRegistryScope)
+        }
+
         // Evict every server-HMR-managed chunk from `require.cache`.
         // Trailing `sep` so e.g. `server/chunks-other/...` doesn't match.
         const serverChunksDir = join(distDir, SERVER_HMR_CHUNKS_DIR) + sep
@@ -2314,14 +2387,16 @@ export async function createHotReloaderTurbopack(
         // the next validation loads the build output afresh.
         dropDevValidationWorker()
 
-        notifyServerComponentChanges()
+        handleServerComponentChanges()
       },
-      onApplied: ({ chunkPaths }) => {
+      onApplied: (update) => {
+        invalidateChangedWebSocketRoutes(update)
+
         // Clear the evalManifest() shared cache for each updated chunk so the
         // next RSC render picks up the HMR-applied module changes. Unlike
         // a full restart, this does NOT clear require.cache — the HMR-applied
         // modules in devModuleCache must persist for dep preservation.
-        const manifestPaths = chunkPaths.map((chunkPath) =>
+        const manifestPaths = update.chunkPaths.map((chunkPath) =>
           join(distDir, chunkPath)
         )
 
@@ -2338,7 +2413,7 @@ export async function createHotReloaderTurbopack(
           evictModules: false,
         })
 
-        notifyServerComponentChanges()
+        handleServerComponentChanges()
       },
     })
     void serverHmrTask.catch((error) => {
