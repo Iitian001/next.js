@@ -115,7 +115,10 @@ import { getDevOverlayFontMiddleware } from '../../next-devtools/server/font/get
 import { devIndicatorServerState } from './dev-indicator-server-state'
 import { getDisableDevIndicatorMiddleware } from '../../next-devtools/server/dev-indicator-middleware'
 import { getRestartDevServerMiddleware } from '../../next-devtools/server/restart-dev-server-middleware'
-import { backgroundLogCompilationEvents } from '../../shared/lib/turbopack/compilation-events'
+import {
+  backgroundLogCompilationEvents,
+  closeSubscriptionOnAbort,
+} from '../../shared/lib/turbopack/compilation-events'
 import { DeferredEmit } from '../../shared/lib/turbopack/deferred-emit'
 import { getSupportedBrowsers } from '../../build/get-supported-browsers'
 import { printBuildErrors } from '../../build/print-build-errors'
@@ -336,28 +339,7 @@ function setupServerHmr(
 ): Promise<void> {
   async function runSubscription() {
     const subscription = project.serverHmrEvents()
-    let closePromise: Promise<IteratorResult<unknown>> | undefined
-    const closeSubscription = () => {
-      if (!closePromise) {
-        try {
-          closePromise = subscription.return
-            ? Promise.resolve(subscription.return(undefined as never))
-            : Promise.resolve({ done: true, value: undefined })
-        } catch (error) {
-          closePromise = Promise.reject(error)
-        }
-        void closePromise.catch(() => {})
-      }
-      return closePromise
-    }
-    const handleAbort = () => {
-      void closeSubscription()
-    }
-    if (signal.aborted) handleAbort()
-    else {
-      signal.addEventListener('abort', handleAbort, { once: true })
-      if (signal.aborted) handleAbort()
-    }
+    const closeIterator = closeSubscriptionOnAbort(subscription, signal)
 
     let hasPrimaryError = false
     try {
@@ -437,9 +419,9 @@ function setupServerHmr(
       hasPrimaryError = true
       throw error
     } finally {
-      signal.removeEventListener('abort', handleAbort)
+      closeIterator.dispose()
       try {
-        await closeSubscription()
+        await closeIterator.close()
       } catch (error) {
         if (!hasPrimaryError) throw error
       }
