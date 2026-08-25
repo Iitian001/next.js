@@ -1,7 +1,7 @@
 import { nextTestSetup } from 'e2e-utils'
 
 describe('Page Config', () => {
-  const { next } = nextTestSetup({
+  const { next, isTurbopack } = nextTestSetup({
     files: __dirname,
     skipStart: true,
   })
@@ -18,9 +18,19 @@ describe('Page Config', () => {
 
     try {
       const { cliOutput } = await next.build()
-      expect(cliOutput).toContain(
-        "Next.js can't recognize the exported `config`"
-      )
+      if (isTurbopack) {
+        expect(cliOutput).toContain('./pages/invalid/string-config.js')
+        expect(cliOutput).toContain(
+          "Next.js can't recognize the exported `config` field in route. It needs to be a static object."
+        )
+      } else {
+        expect(cliOutput).toContain(
+          'Invalid segment configuration options detected for "/invalid/string-config"'
+        )
+        expect(cliOutput).toContain(
+          'Expected object, received string at "config"'
+        )
+      }
     } finally {
       await next.patchFile('pages/invalid/string-config.js', origContent)
     }
