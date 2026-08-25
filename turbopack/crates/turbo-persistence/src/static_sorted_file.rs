@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     cmp::Ordering,
     hash::BuildHasherDefault,
     io,
@@ -101,8 +100,8 @@ impl From<LookupValue> for SstLookupResult {
 #[derive(Clone, Default)]
 pub struct BlockWeighter;
 
-impl quick_cache::Weighter<(u32, u16), ArcBytes> for BlockWeighter {
-    fn weight(&self, _key: &(u32, u16), val: &ArcBytes) -> u64 {
+impl quick_cache::Weighter<(u32, u16), ArcBytes<'static>> for BlockWeighter {
+    fn weight(&self, _key: &(u32, u16), val: &ArcBytes<'static>) -> u64 {
         if val.is_mmap_backed() {
             // Mmap-backed blocks bypass the cache (served directly from mmap),
             // so this branch should never be reached.
@@ -122,11 +121,11 @@ impl quick_cache::Weighter<(u32, u16), ArcBytes> for BlockWeighter {
 #[derive(Clone, Default)]
 pub struct BlockCacheLifecycle;
 
-impl Lifecycle<(u32, u16), ArcBytes> for BlockCacheLifecycle {
+impl Lifecycle<(u32, u16), ArcBytes<'static>> for BlockCacheLifecycle {
     type RequestState = ();
 
     #[inline]
-    fn is_pinned(&self, _key: &(u32, u16), val: &ArcBytes) -> bool {
+    fn is_pinned(&self, _key: &(u32, u16), val: &ArcBytes<'static>) -> bool {
         val.is_shared_arc()
     }
 
@@ -134,12 +133,13 @@ impl Lifecycle<(u32, u16), ArcBytes> for BlockCacheLifecycle {
     fn begin_request(&self) -> Self::RequestState {}
 
     #[inline]
-    fn on_evict(&self, _state: &mut Self::RequestState, _key: (u32, u16), _val: ArcBytes) {}
+    fn on_evict(&self, _state: &mut Self::RequestState, _key: (u32, u16), _val: ArcBytes<'static>) {
+    }
 }
 
 pub type BlockCache = quick_cache::sync::Cache<
     (u32, u16),
-    ArcBytes,
+    ArcBytes<'static>,
     BlockWeighter,
     BuildHasherDefault<FxHasher>,
     BlockCacheLifecycle,
@@ -159,8 +159,12 @@ struct ArcBlockCacheReader<'a> {
     verified_blocks: &'a [AtomicU64],
 }
 
-impl ValueBlockCache<ArcBytes> for ArcBlockCacheReader<'_> {
-    fn get_or_read(self, meta: &StaticSortedFileMetaData, block_index: u16) -> Result<ArcBytes> {
+impl ValueBlockCache<ArcBytes<'static>> for ArcBlockCacheReader<'_> {
+    fn get_or_read(
+        self,
+        meta: &StaticSortedFileMetaData,
+        block_index: u16,
+    ) -> Result<ArcBytes<'static>> {
         get_or_cache_block(
             self.backing,
             meta,
@@ -170,7 +174,11 @@ impl ValueBlockCache<ArcBytes> for ArcBlockCacheReader<'_> {
         )
     }
 
-    fn read_uncached(self, meta: &StaticSortedFileMetaData, block_index: u16) -> Result<ArcBytes> {
+    fn read_uncached(
+        self,
+        meta: &StaticSortedFileMetaData,
+        block_index: u16,
+    ) -> Result<ArcBytes<'static>> {
         read_block_lookup(self.backing, meta, block_index)
     }
 }
@@ -380,7 +388,7 @@ impl StaticSortedFile {
     /// If `FIND_ALL` is true, collects all entries with the same key.
     fn lookup_key_block<K: QueryKey, const FIND_ALL: bool>(
         &self,
-        block: ArcBytes,
+        block: ArcBytes<'static>,
         key_hash: u64,
         key: &K,
         has_hash: bool,
@@ -408,7 +416,7 @@ impl StaticSortedFile {
     /// enabling direct indexing during binary search.
     fn lookup_fixed_key_block<K: QueryKey, const FIND_ALL: bool>(
         &self,
-        block: ArcBytes,
+        block: ArcBytes<'static>,
         key_hash: u64,
         key: &K,
         has_hash: bool,
@@ -442,7 +450,7 @@ impl StaticSortedFile {
     /// key blocks (offset table lookup) and fixed-size key blocks (stride-based indexing).
     fn lookup_block_inner<'a, K: QueryKey, const FIND_ALL: bool>(
         &self,
-        block: &ArcBytes,
+        block: &ArcBytes<'static>,
         entry_count: usize,
         key_hash: u64,
         key: &K,
@@ -522,7 +530,7 @@ impl StaticSortedFile {
         &self,
         ty: u8,
         val: &[u8],
-        key_block_arc: &ArcBytes,
+        key_block_arc: &ArcBytes<'static>,
         reader: ArcBlockCacheReader<'_>,
     ) -> Result<LookupValue> {
         handle_key_match_generic(&self.meta, ty, val, key_block_arc, reader)
@@ -543,7 +551,7 @@ fn get_or_cache_block(
     block_index: u16,
     cache: &BlockCache,
     verified_blocks: &[AtomicU64],
-) -> Result<ArcBytes> {
+) -> Result<ArcBytes<'static>> {
     if let StaticSortedFileBacking::Mmap(mmap) = backing {
         let (uncompressed_length, checksum, block_data) =
             get_raw_block_slice(mmap, meta, block_index).with_context(|| {
@@ -556,7 +564,7 @@ fn get_or_cache_block(
         if uncompressed_length == 0 {
             verify_checksum_once(meta, block_data, checksum, block_index, verified_blocks)?;
             // SAFETY: block_data points into the mmap backing `mmap`.
-            return Ok(unsafe { ArcBytes::from_mmap(mmap, block_data) });
+            return Ok(unsafe { ArcBytes::from_mmap(mmap.clone(), block_data) });
         }
     }
 
@@ -579,7 +587,7 @@ fn get_or_cache_block(
                     }
                 }
                 let block = if uncompressed_length == 0 {
-                    ArcBytes::from(block_data.into_owned().into_boxed_slice())
+                    block_data.into_static()
                 } else {
                     ArcBytes::from_decompressed(uncompressed_length, &block_data).with_context(
                         || {
@@ -664,12 +672,14 @@ fn get_raw_block<'a>(
     backing: &'a StaticSortedFileBacking,
     meta: &StaticSortedFileMetaData,
     block_index: u16,
-) -> Result<(u32, u32, Cow<'a, [u8]>)> {
+) -> Result<(u32, u32, ArcBytes<'a>)> {
     match backing {
         StaticSortedFileBacking::Mmap(mmap) => {
             let (uncompressed_length, checksum, block) =
                 get_raw_block_slice(mmap, meta, block_index)?;
-            Ok((uncompressed_length, checksum, Cow::Borrowed(block)))
+            Ok((uncompressed_length, checksum, unsafe {
+                ArcBytes::from_mmap_ref(mmap, block)
+            }))
         }
         StaticSortedFileBacking::File {
             file,
@@ -699,7 +709,11 @@ fn get_raw_block<'a>(
             let uncompressed_length = be::read_u32(&bytes);
             let checksum = be::read_u32(&bytes[4..]);
             let block = bytes.split_off(BLOCK_HEADER_SIZE);
-            Ok((uncompressed_length, checksum, Cow::Owned(block)))
+            Ok((
+                uncompressed_length,
+                checksum,
+                ArcBytes::from(block.into_boxed_slice()),
+            ))
         }
     }
 }
@@ -781,17 +795,11 @@ fn read_block_lookup(
     backing: &StaticSortedFileBacking,
     meta: &StaticSortedFileMetaData,
     block_index: u16,
-) -> Result<ArcBytes> {
+) -> Result<ArcBytes<'static>> {
     let (uncompressed_length, checksum, block) = get_raw_block(backing, meta, block_index)?;
     verify_checksum(meta, &block, checksum, block_index)?;
     if uncompressed_length == 0 {
-        return match (backing, block) {
-            (StaticSortedFileBacking::Mmap(mmap), Cow::Borrowed(block)) => {
-                // SAFETY: block points into mmap.
-                Ok(unsafe { ArcBytes::from_mmap(mmap, block) })
-            }
-            (_, block) => Ok(ArcBytes::from(block.into_owned().into_boxed_slice())),
-        };
+        return Ok(block.into_static());
     }
     ArcBytes::from_decompressed(uncompressed_length, &block)
 }
