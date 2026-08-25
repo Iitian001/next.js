@@ -41,4 +41,6 @@ turbopack-cli-utils = { workspace = true }
 turbopack-core = { workspace = true }
 turbopack-resolve = { workspace = true }
 turbopack-trace-utils = { workspace = true }
+# TODO remove
+turbopack-node = { workspace = true, default-features = false, features = ["process_pool"]}
 
