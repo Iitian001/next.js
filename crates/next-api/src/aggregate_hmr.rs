@@ -152,7 +152,7 @@ impl ChunkListUpdateBuilder {
         !update.entries.is_empty() || !update.chunks.is_empty()
     }
 
-    pub fn add_instruction(&mut self, instruction: &UpdateInstruction) {
+    fn add_instruction(&mut self, instruction: &UpdateInstruction) {
         let instruction = instruction
             .downcast_ref::<EcmascriptUpdateInstruction>()
             .expect("aggregate HMR only accepts ECMAScript update instructions");
@@ -406,6 +406,57 @@ mod tests {
             find_removed_entries(previous.iter(), no_current_entries.iter()),
             [RcStr::from("a/route.js"), RcStr::from("z/route.js")]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instruction_with_chunks_always_carries_affected_entries() {
+        // Cross-boundary invariant: any built instruction whose chunks (or
+        // merged chunk keys) are non-empty must also carry non-empty
+        // affected_entries. The hot-reloader treats chunkPaths > 0 with
+        // affectedEntries === 0 as "unknown" and falls back to a full-scope
+        // reload, so emitting richer hints here keeps per-route teardown
+        // precise.
+        let tt = turbo_tasks::TurboTasks::new(TurboTasksBackend::new(
+            BackendOptions::default(),
+            noop_backing_storage(),
+        ));
+        tt.run_once(async {
+            let mut builder = ChunkListUpdateBuilder::default();
+            builder.add_entry_instruction(
+                "a.js",
+                &ChunkListUpdate {
+                    chunks: FxIndexMap::from_iter([("a.js".into(), ChunkUpdate::Added)]),
+                    merged: vec![],
+                    affected_entries: vec![],
+                }
+                .into_instruction(),
+            );
+
+            let to = ResolvedVc::upcast::<Box<dyn Version>>(
+                AggregateHmrVersion {
+                    versions: Default::default(),
+                }
+                .resolved_cell(),
+            )
+            .into_trait_ref()
+            .await?;
+            let Update::Partial(update) = builder.build(to) else {
+                panic!("an instruction with chunks must be a partial update");
+            };
+
+            assert_eq!(
+                serde_json::to_value(&update.instruction)?,
+                serde_json::json!({
+                    "type": "ChunkListUpdate",
+                    "chunks": { "a.js": { "type": "added" } },
+                    "affectedEntries": ["a.js"]
+                })
+            );
+
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
