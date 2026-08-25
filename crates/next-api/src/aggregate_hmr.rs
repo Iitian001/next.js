@@ -142,8 +142,7 @@ impl ChunkListUpdateBuilder {
         };
         match instruction {
             EcmascriptUpdateInstruction::ChunkList(update) => {
-                !update.chunks.is_empty()
-                    || update.merged.iter().any(Self::merged_has_changes)
+                !update.chunks.is_empty() || update.merged.iter().any(Self::merged_has_changes)
             }
             EcmascriptUpdateInstruction::Merged(update) => Self::merged_has_changes(update),
         }
@@ -270,6 +269,7 @@ pub async fn diff_chunks_against(
 
 #[cfg(test)]
 mod tests {
+    use turbo_rcstr::RcStr;
     use turbo_tasks::{FxIndexMap, FxIndexSet, ResolvedVc, TraitRef};
     use turbo_tasks_backend::{BackendOptions, TurboTasksBackend, noop_backing_storage};
     use turbopack_core::{
