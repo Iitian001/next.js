@@ -16,6 +16,10 @@ export type WebSocketUpgradeOwnership =
   | 'sibling'
   | 'shared'
 
+/** Shared guidance emitted by both dispatch layers when an upgrade is delegated. */
+export const UPGRADE_DELEGATION_MESSAGE =
+  'Next.js delegated an upgrade event because another custom-server upgrade listener may own the socket. Use app.getUpgradeHandler() from one outer dispatcher to coordinate WebSocket Route Handlers with another protocol.'
+
 type NextOwnedUpgradeListener = {
   isWebSocketRouteHandlersEnabled: () => boolean
   isHMRRequest: (url: string | undefined) => boolean

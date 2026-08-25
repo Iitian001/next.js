@@ -93,7 +93,10 @@ import {
   tryAcquireWebSocketScopeLease,
   type WebSocketScopeLease,
 } from '../websocket-connection-registry'
-import { isNextHMRUpgradeRequest } from '../websocket-upgrade-listener'
+import {
+  isNextHMRUpgradeRequest,
+  UPGRADE_DELEGATION_MESSAGE,
+} from '../websocket-upgrade-listener'
 
 const debug = setupDebug('next:router-server:main')
 const isNextFont = (pathname: string | null) =>
@@ -1045,9 +1048,7 @@ export async function initialize(opts: {
       // dispatcher, a shared server must leave every non-HMR upgrade entirely
       // to its embedding listeners. Those listeners may already have accepted
       // the socket and are allowed to mutate the request headers.
-      Log.warnOnce(
-        'Next.js delegated an upgrade event because another custom-server upgrade listener may own the socket. Use app.getUpgradeHandler() from one outer dispatcher to coordinate WebSocket Route Handlers with another protocol.'
-      )
+      Log.warnOnce(UPGRADE_DELEGATION_MESSAGE)
       return
     }
 
