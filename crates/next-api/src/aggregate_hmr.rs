@@ -1,4 +1,7 @@
-use std::{fmt::Display, sync::Arc};
+use std::{
+    fmt::Display,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::Result;
 use serde::Serialize;
@@ -54,6 +57,36 @@ impl ServerHmrChunkLists {
 pub fn is_entry_chunk_list_content(content: ResolvedVc<Box<dyn VersionedContent>>) -> bool {
     ResolvedVc::try_downcast_type::<EcmascriptBuildNodeChunkListContent>(content).is_some()
         || ResolvedVc::try_downcast_type::<EcmascriptDevChunkListContent>(content).is_some()
+}
+
+#[derive(Debug, Default)]
+pub struct ServerHmrEntryMap {
+    entries: RwLock<FxIndexMap<RcStr, ResolvedVc<ServerHmrChunkLists>>>,
+}
+
+impl PartialEq for ServerHmrEntryMap {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for ServerHmrEntryMap {}
+
+impl ServerHmrEntryMap {
+    pub fn set(&self, entry_key: RcStr, chunk_lists: ResolvedVc<ServerHmrChunkLists>) {
+        self.entries
+            .write()
+            .expect("server HMR entry map lock poisoned")
+            .insert(entry_key, chunk_lists);
+    }
+
+    pub fn get(&self, entry_key: &str) -> Option<ResolvedVc<ServerHmrChunkLists>> {
+        self.entries
+            .read()
+            .expect("server HMR entry map lock poisoned")
+            .get(entry_key)
+            .copied()
+    }
 }
 
 #[turbo_tasks::value(serialization = "skip", shared)]

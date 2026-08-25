@@ -187,7 +187,7 @@ function setupServerHmr(
   reEvaluateAllModulesExpensive: () => Promise<void>
 ) {
   let pending = Promise.resolve()
-  let version: ServerHmrVersion | undefined
+  const versions = new Map<EntryKey, ServerHmrVersion>()
   let needsReEvaluation = false
 
   async function recover() {
@@ -199,7 +199,7 @@ function setupServerHmr(
     }
   }
 
-  return function applyServerHmrUpdate(entryPaths: string[]): Promise<void> {
+  return function applyServerHmrUpdate(entryKey: EntryKey): Promise<void> {
     const apply = pending.then(async () => {
       if (needsReEvaluation) {
         await recover()
@@ -207,8 +207,9 @@ function setupServerHmr(
       }
 
       try {
-        const update = await project.getServerHmrUpdate(version, entryPaths)
-        version = update.version ?? version
+        const version = versions.get(entryKey)
+        const update = await project.getServerHmrUpdate(entryKey, version)
+        if (update.version) versions.set(entryKey, update.version)
         switch (update.kind) {
           case 'none':
             return
@@ -1921,7 +1922,7 @@ export async function createHotReloaderTurbopack(
           // same predicate as the require-cache handling rather than a second,
           // coarser reading of `route.type`.
           let shouldPullServerHmr = false
-          let serverHmrEntryPaths: string[] = []
+          let serverHmrEntryKey: EntryKey | undefined
           try {
             await handleRouteType({
               dev,
@@ -1947,9 +1948,7 @@ export async function createHotReloaderTurbopack(
                   currentWrittenEntrypoints.set(id, result)
                   assetMapper.setPathsForKey(id, result.clientPaths)
                   shouldPullServerHmr ||= participatesInServerHmr(id, result)
-                  if (result.serverHmrEntryPaths.length > 0) {
-                    serverHmrEntryPaths = result.serverHmrEntryPaths
-                  }
+                  serverHmrEntryKey = id
                   return clearRequireCache(id, result, {
                     force: forceDeleteCache,
                   })
@@ -1959,8 +1958,8 @@ export async function createHotReloaderTurbopack(
 
             // The only server HMR pull, driven by the request being built — which
             // is what makes evaluating a changed module lazy.
-            if (shouldPullServerHmr && serverHmrEntryPaths.length > 0) {
-              await applyServerHmrUpdate(serverHmrEntryPaths)
+            if (shouldPullServerHmr && serverHmrEntryKey) {
+              await applyServerHmrUpdate(serverHmrEntryKey)
             }
           } finally {
             finishBuilding()

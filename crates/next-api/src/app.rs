@@ -49,7 +49,7 @@ use turbopack::{
     transition::{FullContextTransition, Transition, TransitionOptions},
 };
 use turbopack_core::{
-    asset::AssetContent,
+    asset::{Asset, AssetContent},
     chunk::{
         ChunkGroupResult, ChunkingContext, ChunkingContextExt, EvaluatableAsset, EvaluatableAssets,
         availability_info::AvailabilityInfo,
@@ -72,6 +72,7 @@ use turbopack_ecmascript::single_file_ecmascript_output::SingleFileEcmascriptOut
 use turbopack_resolve::{ecmascript::cjs_resolve, resolve_options_context::ResolveOptionsContext};
 
 use crate::{
+    aggregate_hmr::{ServerHmrChunkList, ServerHmrChunkLists},
     dynamic_imports::{NextDynamicChunkAvailability, collect_next_dynamic_chunks},
     font::FontManifest,
     loadable_manifest::create_react_loadable_manifest,
@@ -1382,7 +1383,7 @@ impl AppEndpoint {
         // TODO: This anchor can go away once edges to chunk references are represented explicitly
         // in the chunk graph (rsc chunk -> ssr chunk), which would make the SSR chunks reachable
         // from the RSC chunk lists directly.
-        if is_app_page
+        let ssr_hmr_chunk_list = if is_app_page
             && runtime == NextRuntime::NodeJs
             && project
                 .client_compile_time_info()
@@ -1402,7 +1403,10 @@ impl AppEndpoint {
                 .to_resolved()
                 .await?;
             server_assets.insert(ssr_hmr_chunks);
-        }
+            Some(ssr_hmr_chunks)
+        } else {
+            None
+        };
 
         // In development, register a page-specific HMR chunk list that owns all client
         // reference chunks for this page. These chunks are computed via separate
@@ -1774,6 +1778,27 @@ impl AppEndpoint {
             NextRuntime::NodeJs => {
                 // For node, there will be exactly one asset in this
                 let rsc_chunk = *app_entry_chunks_ref.first().unwrap();
+                let app_server_root = server_path.join("app")?;
+                let mut server_hmr_chunks = vec![ServerHmrChunkList {
+                    relative_path: app_server_root
+                        .get_path_to(&*rsc_chunk.path().await?)
+                        .context("server HMR entry must be inside the app server root")?
+                        .into(),
+                    versioned_content: rsc_chunk.versioned_content().to_resolved().await?,
+                }];
+                if let Some(ssr_hmr_chunk_list) = ssr_hmr_chunk_list {
+                    server_hmr_chunks.push(ServerHmrChunkList {
+                        relative_path: app_server_root
+                            .get_path_to(&*ssr_hmr_chunk_list.path().await?)
+                            .context("server HMR entry must be inside the app server root")?
+                            .into(),
+                        versioned_content: ssr_hmr_chunk_list
+                            .versioned_content()
+                            .to_resolved()
+                            .await?,
+                    });
+                }
+                let server_hmr_chunks = ServerHmrChunkLists::new(server_hmr_chunks).resolved_cell();
 
                 if emit_manifests != EmitManifests::None {
                     // create app paths manifest
@@ -1851,6 +1876,7 @@ impl AppEndpoint {
                     rsc_chunk,
                     server_assets,
                     client_assets,
+                    server_hmr_chunks,
                 }
             }
         }
@@ -2160,31 +2186,29 @@ impl Endpoint for AppEndpoint {
                 (vec![], vec![])
             };
 
-            let written_endpoint = match *output.await? {
-                AppEndpointOutput::NodeJs { rsc_chunk, .. } => {
-                    let server_entry_path: RcStr = node_root
-                        .get_path_to(&*rsc_chunk.path().await?)
-                        .context("Node.js chunk entry path must be inside the node root")?
-                        .into();
-                    let hmr_entry_path = server_entry_path
-                        .strip_prefix("server/app/")
-                        .unwrap_or(&server_entry_path)
-                        .strip_suffix(".js")
-                        .unwrap_or(&server_entry_path);
+            let (written_endpoint, server_hmr_chunks) = match *output.await? {
+                AppEndpointOutput::NodeJs {
+                    rsc_chunk,
+                    server_hmr_chunks,
+                    ..
+                } => (
                     EndpointOutputPaths::NodeJs {
-                        server_hmr_entry_paths: vec![
-                            format!("{hmr_entry_path}.js").into(),
-                            format!("{hmr_entry_path}/client-components-ssr.js").into(),
-                        ],
-                        server_entry_path,
+                        server_entry_path: node_root
+                            .get_path_to(&*rsc_chunk.path().await?)
+                            .context("Node.js chunk entry path must be inside the node root")?
+                            .into(),
                         server_paths,
                         client_paths,
-                    }
-                }
-                AppEndpointOutput::Edge { .. } => EndpointOutputPaths::Edge {
-                    server_paths,
-                    client_paths,
-                },
+                    },
+                    Some(server_hmr_chunks),
+                ),
+                AppEndpointOutput::Edge { .. } => (
+                    EndpointOutputPaths::Edge {
+                        server_paths,
+                        client_paths,
+                    },
+                    None,
+                ),
             };
 
             anyhow::Ok(
@@ -2192,6 +2216,7 @@ impl Endpoint for AppEndpoint {
                     output_assets: output_assets.to_resolved().await?,
                     output_paths: written_endpoint.resolved_cell(),
                     project: project.to_resolved().await?,
+                    server_hmr_chunks,
                 }
                 .cell(),
             )
@@ -2328,6 +2353,7 @@ enum AppEndpointOutput {
         rsc_chunk: ResolvedVc<Box<dyn OutputAsset>>,
         server_assets: ResolvedVc<OutputAssets>,
         client_assets: ResolvedVc<OutputAssets>,
+        server_hmr_chunks: ResolvedVc<ServerHmrChunkLists>,
     },
     Edge {
         files: ResolvedVc<OutputAssets>,
