@@ -1,6 +1,6 @@
 import { nextTestSetup } from 'e2e-utils'
 import { check, waitFor } from 'next-test-utils'
-import http from 'node:http'
+import { requestWebSocketUpgrade } from 'next-websocket-test-utils'
 import path from 'path'
 import WebSocket from 'ws'
 
@@ -130,47 +130,27 @@ describe('multi-zone', () => {
       })
     }
 
-    function requestUpgrade(
-      pathname: string,
-      origin: string,
-      extraHeaders: Record<string, string> = {}
-    ) {
-      return new Promise<number>((resolve, reject) => {
-        const request = http.request({
-          host: 'localhost',
-          port: next.appPort,
-          path: pathname,
-          headers: {
-            connection: 'Upgrade',
-            origin,
-            'sec-websocket-key': Buffer.alloc(16).toString('base64'),
-            'sec-websocket-version': '13',
-            upgrade: 'websocket',
-            ...extraHeaders,
-          },
-        })
-        request.once('response', (response) => {
-          response.resume()
-          response.once('end', () => resolve(response.statusCode!))
-        })
-        request.once('upgrade', (response, socket) => {
-          socket.destroy()
-          resolve(response.statusCode!)
-        })
-        request.once('error', reject)
-        request.end()
-      })
-    }
-
     expect(
-      await requestUpgrade('/missing-socket', 'https://host.example')
+      await requestWebSocketUpgrade(next, '/missing-socket', {
+        statusOnly: true,
+        headers: { origin: 'https://host.example' },
+      })
     ).toBe(404)
-    expect(await requestUpgrade('/socket', 'https://guest.example')).toBe(403)
+    expect(
+      await requestWebSocketUpgrade(next, '/socket', {
+        statusOnly: true,
+        headers: { origin: 'https://guest.example' },
+      })
+    ).toBe(403)
 
     const malformedLogStart = next.cliOutput.length
     expect(
-      await requestUpgrade('/socket', 'https://host.example', {
-        'transfer-encoding': 'chunked',
+      await requestWebSocketUpgrade(next, '/socket', {
+        statusOnly: true,
+        headers: {
+          origin: 'https://host.example',
+          'transfer-encoding': 'chunked',
+        },
       })
     ).toBe(400)
     expect(next.cliOutput.slice(malformedLogStart)).not.toContain(
